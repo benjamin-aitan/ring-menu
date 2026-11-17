@@ -72,19 +72,40 @@ class MissionContext:
 
     :param target: The target this context belongs to.
     :param available_drones: Shared list of strike drones that can be assigned.
+    :param available_isr_drones: Shared list of ISR drones that can be assigned.
     :param isr_mode: Selected ISR lock behaviour, or ``None`` if not locked.
+    :param isr_drone: ISR drone tasked with the lock, or ``None``.
     :param is_strike_target: Whether the target is designated for strike.
     :param strike_assignments: Strike-drone slots added by the operator.
     """
 
     target: Target
     available_drones: List[str]
+    available_isr_drones: List[str] = field(default_factory=list)
     isr_mode: Optional[str] = None
+    isr_drone: Optional[str] = None
     is_strike_target: bool = False
     strike_assignments: List[DroneAssignment] = field(default_factory=list)
     _next_slot_id: int = 1
-    #: Drones assigned to *other* targets; filled in by the owner of all contexts.
-    drones_taken_elsewhere: Callable[[], List[str]] = field(default=lambda: [], repr=False)
+    #: ``drones_taken_elsewhere(kind)`` lists drones of ``kind`` (``"strike"`` or
+    #: ``"isr"``) tasked on *other* targets; set by the owner of all contexts.
+    drones_taken_elsewhere: Callable[[str], List[str]] = field(default=lambda kind: [], repr=False)
+
+    def free_isr_drones(self) -> List[str]:
+        """List ISR drones not tasked on any other target.
+
+        The drone already locked on this target is kept in the list.
+
+        :returns: Selectable ISR drone identifiers, in roster order.
+        :rtype: list[str]
+        """
+        taken = set(self.drones_taken_elsewhere("isr"))
+        return [d for d in self.available_isr_drones if d not in taken]
+
+    def cancel_isr_lock(self) -> None:
+        """Clear the ISR lock mode and release its drone."""
+        self.isr_mode = None
+        self.isr_drone = None
 
     def add_slot(self) -> DroneAssignment:
         """Append a new, empty strike-drone slot.
@@ -134,7 +155,7 @@ class MissionContext:
             for a in self.strike_assignments
             if a.drone_id is not None and a.slot_id != for_slot_id
         }
-        taken.update(self.drones_taken_elsewhere())
+        taken.update(self.drones_taken_elsewhere("strike"))
         return [d for d in self.available_drones if d not in taken]
 
     def to_dict(self) -> dict:
@@ -151,7 +172,11 @@ class MissionContext:
                 "bbox": {"x": x, "y": y, "w": w, "h": h},
                 "geo": {"lat": self.target.lat, "lon": self.target.lon},
             },
-            "isr_lock": {"locked": self.isr_mode is not None, "mode": self.isr_mode},
+            "isr_lock": {
+                "locked": self.isr_mode is not None,
+                "mode": self.isr_mode,
+                "drone_id": self.isr_drone,
+            },
             "strike": {
                 "is_strike_target": self.is_strike_target,
                 "drones": [
@@ -509,6 +534,138 @@ class SelectFromListNode(MenuNode):
         return ClickResult.OPEN if self.children(ctx) else ClickResult.CLOSE
 
 
+class AssignIsrDroneNode(SelectFromListNode):
+    """Button that assigns an ISR drone to the target's ISR lock via a dropdown.
+
+    The dropdown lists ISR drones not tasked on other targets, plus an entry
+    that cancels the lock.
+    """
+
+    CANCEL = "✕ Cancel ISR lock"
+
+    def __init__(self) -> None:
+        """Initialise the button."""
+        super().__init__("Assign\nISR drone", icon="◉")
+
+    def options(self, ctx: MissionContext) -> List[str]:
+        """Offer free ISR drones plus a cancel-lock entry.
+
+        :param ctx: Current mission state.
+        :type ctx: MissionContext
+        :returns: ISR drone identifiers followed by :attr:`CANCEL`.
+        :rtype: list[str]
+        """
+        return ctx.free_isr_drones() + [self.CANCEL]
+
+    def current(self, ctx: MissionContext) -> Optional[str]:
+        """Return the ISR drone tasked with the lock.
+
+        :param ctx: Current mission state.
+        :type ctx: MissionContext
+        :returns: The assigned ISR drone, or ``None``.
+        :rtype: str or None
+        """
+        return ctx.isr_drone
+
+    def apply_choice(self, ctx: MissionContext, choice: str) -> None:
+        """Assign the chosen ISR drone, or cancel the lock.
+
+        :param ctx: Current mission state.
+        :type ctx: MissionContext
+        :param choice: Chosen drone, or :attr:`CANCEL`.
+        :type choice: str
+        """
+        if choice == self.CANCEL:
+            ctx.cancel_isr_lock()
+        else:
+            ctx.isr_drone = choice
+
+    def display_label(self, ctx: MissionContext) -> str:
+        """Show the assigned drone, or the assign prompt.
+
+        :param ctx: Current mission state.
+        :type ctx: MissionContext
+        :returns: Label text.
+        :rtype: str
+        """
+        return ctx.isr_drone or self.label
+
+    def is_selected(self, ctx: MissionContext) -> bool:
+        """Drawn as selected once a drone is assigned.
+
+        :param ctx: Current mission state.
+        :type ctx: MissionContext
+        :returns: ``True`` if an ISR drone is assigned.
+        :rtype: bool
+        """
+        return ctx.isr_drone is not None
+
+
+class IsrModeNode(ExclusiveOptionNode):
+    """An ISR lock behaviour; once selected, its ring offers drone assignment.
+
+    Unlike :class:`ExclusiveOptionNode`, clicking the active mode does not clear
+    it; it only shows or hides the assign-drone ring.  The lock is cancelled
+    from the assign-drone dropdown.  Switching modes keeps the assigned drone.
+
+    :param label: Button label.
+    :param value: ISR mode identifier stored in ``ctx.isr_mode``.
+    :param assign_node: Shared assign-drone button shown as the only child.
+    :param icon: Short glyph drawn above the label.
+    """
+
+    def __init__(self, label: str, value: str, assign_node: MenuNode, icon: str = "") -> None:
+        """Initialise the mode button.
+
+        :param label: Button label.
+        :type label: str
+        :param value: ISR mode identifier.
+        :type value: str
+        :param assign_node: Shared assign-drone button.
+        :type assign_node: MenuNode
+        :param icon: Short glyph drawn above the label.
+        :type icon: str
+        """
+        super().__init__(label, "isr_mode", value, icon=icon)
+        self._assign_node = assign_node
+
+    def run(self, ctx: MissionContext, ui: MenuUI) -> None:
+        """Select this mode.
+
+        :param ctx: Current mission state.
+        :type ctx: MissionContext
+        :param ui: UI callbacks.
+        :type ui: MenuUI
+        """
+        ctx.isr_mode = self.value
+        ui.show_message(f"isr_mode = {self.value}")
+
+    def on_click(self, ctx: MissionContext, ui: MenuUI) -> ClickResult:
+        """Select the mode and open its ring; toggle the ring if already active.
+
+        :param ctx: Current mission state.
+        :type ctx: MissionContext
+        :param ui: UI callbacks.
+        :type ui: MenuUI
+        :returns: :attr:`ClickResult.TOGGLE` if the mode was already active,
+            otherwise :attr:`ClickResult.OPEN`.
+        :rtype: ClickResult
+        """
+        was_selected = self.is_selected(ctx)
+        self.run(ctx, ui)
+        return ClickResult.TOGGLE if was_selected else ClickResult.OPEN
+
+    def children(self, ctx: MissionContext) -> List[MenuNode]:
+        """Show the assign-drone button while this mode is active.
+
+        :param ctx: Current mission state.
+        :type ctx: MissionContext
+        :returns: ``[assign_node]`` if selected, else ``[]``.
+        :rtype: list[MenuNode]
+        """
+        return [self._assign_node] if self.is_selected(ctx) else []
+
+
 class StrikeVectorNode(ActionNode):
     """Placeholder button for setting a strike vector on a drone slot.
 
@@ -730,10 +887,11 @@ def build_target_menu(target: Target) -> MenuNode:
     :returns: Root node, drawn as the centre circle.
     :rtype: MenuNode
     """
+    assign_isr = AssignIsrDroneNode()
     isr_modes = [
-        ExclusiveOptionNode("Hover\nand hold", "isr_mode", "hover_hold", icon="⏸"),
-        ExclusiveOptionNode("Maintain\ndist/heading", "isr_mode", "maintain_distance_heading", icon="⇢"),
-        ExclusiveOptionNode("Orbit\ntarget", "isr_mode", "orbit", icon="⟳"),
+        IsrModeNode("Hover\nand hold", "hover_hold", assign_isr, icon="⏸"),
+        IsrModeNode("Maintain\ndist/heading", "maintain_distance_heading", assign_isr, icon="⇢"),
+        IsrModeNode("Orbit\ntarget", "orbit", assign_isr, icon="⟳"),
     ]
     add_drone = DynamicListNode(
         "Add strike\ndrone",
@@ -806,15 +964,16 @@ class MenuController:
         self.open_path: List[MenuNode] = []
 
     def _prune(self) -> None:
-        """Drop open nodes that are no longer children of their parent.
+        """Close open nodes that are gone or have nothing left to show.
 
-        This happens when, for example, a drone slot is removed.
+        This happens when, for example, a drone slot is removed or the ISR
+        lock is cancelled.
         """
         if not self.open_path:
             return
         valid = [self.open_path[0]]
         for node in self.open_path[1:]:
-            if node in valid[-1].children(self.ctx):
+            if node in valid[-1].children(self.ctx) and node.children(self.ctx):
                 valid.append(node)
             else:
                 break

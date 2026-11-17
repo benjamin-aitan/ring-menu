@@ -28,6 +28,7 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
     QTextOption,
 )
 from PySide6.QtWidgets import (
@@ -66,9 +67,12 @@ from menu_model import (
 
 HERE = Path(__file__).resolve().parent
 OUTPUT_DIR = HERE / "outputs"
+#: Background "video feed"; regenerate with ``make_scenario.py``.
+SCENARIO_IMAGE = HERE / "inputs" / "scenario.png"
 
 SCENE_SIZE = (1200.0, 780.0)
 STRIKE_DRONES = ["Strike-01", "Strike-02", "Strike-03", "Strike-04", "Strike-05"]
+ISR_DRONES = ["ISR-01", "ISR-02", "ISR-03"]
 DEMO_TARGETS = [
     Target("T1", "Tank", (380, 330, 96, 62), 34.052235, -118.243683, color="#d64545"),
     Target("T2", "Truck", (760, 500, 116, 64), 34.054120, -118.239870, color="#e0a030"),
@@ -258,6 +262,7 @@ class RadialMenuView(QGraphicsView, MenuUI):
     :param on_change: Called after every state change.
     :param on_message: Called with status messages.
     :param style: Ring layout sizes.
+    :param isr_drones: ISR-drone roster shared by all targets.
     """
 
     def __init__(
@@ -267,6 +272,7 @@ class RadialMenuView(QGraphicsView, MenuUI):
         on_change: Callable[[], None],
         on_message: Callable[[str], None],
         style: RingStyle = RingStyle(),
+        isr_drones: Sequence[str] = tuple(ISR_DRONES),
     ) -> None:
         """Create the scene, the target boxes and one menu per target.
 
@@ -280,6 +286,8 @@ class RadialMenuView(QGraphicsView, MenuUI):
         :type on_message: Callable[[str], None]
         :param style: Ring layout sizes.
         :type style: RingStyle
+        :param isr_drones: ISR-drone roster shared by all targets.
+        :type isr_drones: Sequence[str]
         """
         super().__init__()
         self.scene_ = QGraphicsScene(0, 0, *SCENE_SIZE)
@@ -293,13 +301,18 @@ class RadialMenuView(QGraphicsView, MenuUI):
         self._on_message = on_message
         self._menu_items: List[QGraphicsItem] = []
         self.active_id: Optional[str] = None
+        self._feed: Optional[QPixmap] = (
+            QPixmap(str(SCENARIO_IMAGE)) if SCENARIO_IMAGE.exists() else None
+        )
 
         self.targets: Dict[str, Target] = {t.target_id: t for t in targets}
         self.contexts: Dict[str, MissionContext] = {}
         self.controllers: Dict[str, MenuController] = {}
         self._target_items: Dict[str, TargetItem] = {}
         for t in targets:
-            ctx = MissionContext(target=t, available_drones=drones)
+            ctx = MissionContext(
+                target=t, available_drones=drones, available_isr_drones=list(isr_drones)
+            )
             ctx.drones_taken_elsewhere = self._taken_elsewhere_fn(t.target_id)
             self.contexts[t.target_id] = ctx
             self.controllers[t.target_id] = MenuController(build_target_menu(t), ctx)
@@ -307,21 +320,30 @@ class RadialMenuView(QGraphicsView, MenuUI):
             self.scene_.addItem(item)
             self._target_items[t.target_id] = item
 
-    def _taken_elsewhere_fn(self, target_id: str) -> Callable[[], List[str]]:
+    def _taken_elsewhere_fn(self, target_id: str) -> Callable[[str], List[str]]:
         """Make a callback listing drones assigned to targets other than one.
 
         :param target_id: Target to exclude.
         :type target_id: str
-        :returns: Callback returning the drone identifiers.
-        :rtype: Callable[[], list[str]]
+        :returns: Callback ``taken(kind)`` returning drone identifiers, where
+            ``kind`` is ``"strike"`` or ``"isr"``.
+        :rtype: Callable[[str], list[str]]
         """
 
-        def taken() -> List[str]:
-            """List drones assigned to other targets.
+        def taken(kind: str) -> List[str]:
+            """List drones of one kind assigned to other targets.
 
+            :param kind: ``"strike"`` or ``"isr"``.
+            :type kind: str
             :returns: Drone identifiers.
             :rtype: list[str]
             """
+            if kind == "isr":
+                return [
+                    ctx.isr_drone
+                    for tid, ctx in self.contexts.items()
+                    if tid != target_id and ctx.isr_drone
+                ]
             return [
                 a.drone_id
                 for tid, ctx in self.contexts.items()
@@ -350,7 +372,7 @@ class RadialMenuView(QGraphicsView, MenuUI):
         """
         menu = QMenu(self)
         if not any(o for o in options if not o.startswith("✕")):
-            empty = menu.addAction("No strike drones available")
+            empty = menu.addAction("No drones available")
             empty.setEnabled(False)
         for option in options:
             if option.startswith("✕"):
@@ -385,13 +407,17 @@ class RadialMenuView(QGraphicsView, MenuUI):
         self.fitInView(self.sceneRect(), Qt.KeepAspectRatio)
 
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802 (Qt naming)
-        """Draw a dark stand-in for the ISR video feed.
+        """Draw the scenario image as the ISR feed, or a dark grid if it is missing.
 
         :param painter: Scene painter.
         :type painter: QPainter
         :param rect: Exposed area.
         :type rect: QRectF
         """
+        if self._feed is not None:
+            painter.fillRect(rect, QColor("#15191c"))  # letterbox bars outside the feed
+            painter.drawPixmap(self.sceneRect(), self._feed, QRectF(self._feed.rect()))
+            return
         gradient = QLinearGradient(0, 0, SCENE_SIZE[0], SCENE_SIZE[1])
         gradient.setColorAt(0.0, QColor("#2b3a2f"))
         gradient.setColorAt(1.0, QColor("#1c2420"))
@@ -503,11 +529,12 @@ class RadialMenuView(QGraphicsView, MenuUI):
     def mission_dict(self) -> dict:
         """Return the state of all targets as one nested dict.
 
-        :returns: ``{"strike_drones": [...], "targets": {id: ctx_dict}}``.
+        :returns: ``{"strike_drones": [...], "isr_drones": [...], "targets": {id: ctx_dict}}``.
         :rtype: dict
         """
         return {
             "strike_drones": list(STRIKE_DRONES),
+            "isr_drones": list(ISR_DRONES),
             "targets": {tid: ctx.to_dict() for tid, ctx in self.contexts.items()},
         }
 
