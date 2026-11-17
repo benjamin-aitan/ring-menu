@@ -2,6 +2,15 @@
 
 A prototype hierarchical radial ("ring") menu for tasking against ATR-detected targets, built with PySide6. Tap a target's bounding box on a simulated drone video frame and nested rings of actions open around it: show geolocation, lock an ISR drone on the target (hover and hold, maintain distance/heading, or orbit), or set it as a strike target and assign strike drones. The resulting mission state is shown live as JSON and can be exported to a file.
 
+## TL:DR
+
+```bash
+git clone git@github.com:benjamin-aitan/ring-menu.git
+cd ring-menu && ./setup_venv.sh
+.venv/bin/python make_scenario.py
+.venv/bin/python radial_menu.py
+```
+
 ## Repository layout
 
 | File | Purpose |
