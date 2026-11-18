@@ -14,6 +14,7 @@ from menu_model import (
     ClickResult,
     AssignIsrDroneNode,
     DroneSlotNode,
+    StrikeTimingNode,
     DynamicListNode,
     ExclusiveOptionNode,
     MenuController,
@@ -44,6 +45,7 @@ class FakeUI(MenuUI):
         :type choices: Sequence[str or None]
         """
         self.choices = list(choices)
+        self.numbers: List[Optional[float]] = []
         self.offered: List[List[str]] = []
         self.messages: List[str] = []
 
@@ -61,6 +63,22 @@ class FakeUI(MenuUI):
         """
         self.offered.append(list(options))
         return self.choices.pop(0)
+
+    def ask_number(self, title: str, current: float, minimum: float, maximum: float) -> Optional[float]:
+        """Return the next scripted number.
+
+        :param title: Prompt.
+        :type title: str
+        :param current: Pre-filled value.
+        :type current: float
+        :param minimum: Smallest accepted value.
+        :type minimum: float
+        :param maximum: Largest accepted value.
+        :type maximum: float
+        :returns: Next scripted number.
+        :rtype: float or None
+        """
+        return self.numbers.pop(0)
 
     def show_message(self, text: str, modal: bool = False) -> None:
         """Record the message.
@@ -281,11 +299,43 @@ def test_add_drone_grows_next_ring_and_dropdown_excludes_assigned() -> None:
     ctrl.click(slots[0], 3, ui)
     assert ui.offered[0][:-1] == ["S1", "S2", "S3"]
     assert ctrl.open_path[-1] is slots[0]  # vector ring opens after choosing
-    assert ctrl.rings()[-1].nodes[0].label.startswith("Strike\nvector")
+    assert ctrl.rings()[-1].nodes[1].label.startswith("Strike\nvector")
 
     ctrl.click(slots[1], 3, ui)
     assert ui.offered[1][:-1] == ["S1", "S3"]
     assert [a.drone_id for a in ctrl.ctx.strike_assignments] == ["S2", "S1"]
+
+
+def test_strike_timing_sequence_is_configurable() -> None:
+    """Later slots strike after a configurable delay; offsets accumulate."""
+    ctrl = make_controller()
+    ctx = ctrl.ctx
+    first, second, third = ctx.add_slot(), ctx.add_slot(), ctx.add_slot()
+    for slot, drone in zip((first, second, third), DRONES):
+        slot.drone_id = drone
+    assert ctx.strike_offsets() == {1: 0.0, 2: 10.0, 3: 20.0}  # default 10 s gap
+
+    node = StrikeTimingNode(second.slot_id)
+    ui = FakeUI()
+    ui.numbers = [4.5]
+    assert node.display_label(ctx).startswith("+10 s")
+    node.run(ctx, ui)
+    assert second.delay_s == 4.5 and node.display_label(ctx).startswith("+4.5 s")
+    ui.numbers = [None]  # cancelled dialog leaves the value alone
+    node.run(ctx, ui)
+    assert second.delay_s == 4.5
+    assert ctx.strike_offsets() == {1: 0.0, 2: 4.5, 3: 14.5}
+
+    first_node = StrikeTimingNode(first.slot_id)  # first strike has nothing to configure
+    first_node.run(ctx, ui)
+    assert first_node.display_label(ctx).startswith("Strike at")
+    drones = ctx.to_dict()["strike"]["drones"]
+    assert [(d["delay_after_previous_s"], d["strike_offset_s"]) for d in drones] == [
+        (None, 0.0), (4.5, 4.5), (10.0, 14.5)
+    ]
+
+    ctx.remove_slot(first.slot_id)  # next slot becomes the first strike
+    assert ctx.strike_offsets() == {2: 0.0, 3: 10.0}
 
 
 def test_removing_open_slot_prunes_path() -> None:
@@ -314,7 +364,7 @@ def test_to_dict_shape() -> None:
     d = ctrl.ctx.to_dict()
     assert d["target"]["geo"] == {"lat": 1.0, "lon": 2.0}
     assert d["isr_lock"] == {"locked": True, "mode": "hover_hold", "drone_id": "I1"}
-    assert d["strike"]["drones"] == [{"slot": 1, "drone_id": "S3", "vector": None}]
+    assert d["strike"]["drones"] == [{"slot": 1, "drone_id": "S3", "vector": None, "delay_after_previous_s": None, "strike_offset_s": 0.0}]
 
 
 # -- Qt smoke test ---------------------------------------------------------------

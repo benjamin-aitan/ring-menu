@@ -56,6 +56,7 @@ On Windows, the script needs Git Bash or WSL. In PowerShell, run the equivalent 
 - Click an ATR bounding box (Tank, Truck or APC) to select it and open the first ring around it. Click it again to close.
 - Click a ring button to open the next ring outward. Clicking a sibling closes the deeper rings of the previous branch.
 - Options that need a drone (assign ISR drone, strike drone slots) open a drop-down list. ISR drones already locked on another target are not offered, and strike drones already assigned are excluded.
+- Strike slots fire in order: the first at T+0, each later one after a configurable delay following the previous strike (default 10 s, `0` = simultaneous). Once a drone is chosen, its ring offers a **Strike timing** button that opens a number dialog. The JSON shows `delay_after_previous_s` and the cumulative `strike_offset_s` per drone.
 - The right-hand panel shows the current mission state as nested JSON. **Export JSON** writes it to `outputs/mission_<timestamp>.json`.
 
 ## Running the tests
