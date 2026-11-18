@@ -2,10 +2,13 @@
 
 Run with ``.venv/bin/python radial_menu.py``.
 
-Tap an ATR bounding box to select it (the box changes colour) and open the
-first ring of actions around it.  Each button opens the next ring
-around it.  The right-hand panel shows the mission state as a nested dict
-(JSON), which can be exported to ``outputs/``.
+The window has three columns: a top-down map of the scene, the oblique drone
+camera view, and the mission state as a nested dict (JSON), which can be
+exported to ``outputs/``.
+
+Tap an ATR bounding box in the camera view to select it (the box changes
+colour, and the same target's box is painted on the map) and open the first
+ring of drone actions around it.  Each button opens the next ring around it.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QPolygonF,
     QTextOption,
 )
 from PySide6.QtWidgets import (
@@ -54,6 +58,8 @@ from PySide6.QtWidgets import (
 )
 
 from menu_model import (
+    DEFAULT_PROJECTION,
+    GroundProjection,
     MenuController,
     MenuNode,
     MenuUI,
@@ -64,12 +70,15 @@ from menu_model import (
     polar_to_xy,
     ring_fan,
     ring_radii,
+    ring_span,
 )
 
 HERE = Path(__file__).resolve().parent
 OUTPUT_DIR = HERE / "outputs"
 #: Background "video feed"; regenerate with ``make_scenario.py``.
 SCENARIO_IMAGE = HERE / "inputs" / "scenario.png"
+#: Top-down map of the same scene; also written by ``make_scenario.py``.
+MAP_IMAGE = HERE / "inputs" / "map.png"
 
 SCENE_SIZE = (1200.0, 780.0)
 STRIKE_DRONES = ["Strike-01", "Strike-02", "Strike-03", "Strike-04", "Strike-05"]
@@ -138,6 +147,7 @@ class SegmentItem(QGraphicsPathItem):
         super().__init__(segment_path(center, r_in, r_out, start, sweep))
         self.node = node
         self.level = level
+        self.angles = (start, sweep)
         self.state = state
         self.setAcceptHoverEvents(True)
         self.setPen(QPen(QColor("#1d2027"), 1.0))
@@ -227,6 +237,121 @@ class TargetItem(QGraphicsRectItem):
         fill.setAlpha(60 if active else 28)
         self.setBrush(QBrush(fill))
         self._label.setBrush(QBrush(color))
+
+
+class MapTargetItem(QGraphicsRectItem):
+    """A target's box on the top-down map.
+
+    :param target: The target to draw.
+    :param rect: Box ``(x, y, w, h)`` in map pixels.
+    """
+
+    def __init__(self, target: Target, rect: Sequence[float]) -> None:
+        """Create the box and its label.
+
+        :param target: The target to draw.
+        :type target: Target
+        :param rect: Box ``(x, y, w, h)`` in map pixels.
+        :type rect: Sequence[float]
+        """
+        x, y, w, h = rect
+        super().__init__(x, y, w, h)
+        self.target = target
+        self.setZValue(5)
+        label = QGraphicsSimpleTextItem(f"{target.target_id} {target.label}", self)
+        label.setFont(QFont("Menlo", 9))
+        label.setPos(x, y - 15)
+        self._label = label
+        self.set_active(False)
+
+    def set_active(self, active: bool) -> None:
+        """Paint the box in the target's colour when selected, faint cyan otherwise.
+
+        :param active: Whether the target is selected.
+        :type active: bool
+        """
+        color = QColor(self.target.color if active else COLORS["bbox"])
+        if not active:
+            color.setAlpha(120)
+        self.setPen(QPen(color, 3.0 if active else 1.0))
+        fill = QColor(color)
+        fill.setAlpha(70 if active else 0)
+        self.setBrush(QBrush(fill))
+        self._label.setBrush(QBrush(color))
+        self._label.setVisible(active)
+        self.setZValue(6 if active else 5)
+
+
+class MapView(QGraphicsView):
+    """Display-only top-down map that highlights the selected target.
+
+    :param targets: Targets to mark on the map.
+    :param projection: Projection from camera-image to map pixels.
+    """
+
+    def __init__(self, targets: Sequence[Target], projection: GroundProjection = DEFAULT_PROJECTION) -> None:
+        """Create the map scene and one box per target.
+
+        :param targets: Targets to mark on the map.
+        :type targets: Sequence[Target]
+        :param projection: Projection from camera-image to map pixels.
+        :type projection: GroundProjection
+        """
+        super().__init__()
+        self.projection = projection
+        self.scene_ = QGraphicsScene(0, 0, *projection.map_size)
+        self.setScene(self.scene_)
+        self.setRenderHint(QPainter.Antialiasing)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._map: Optional[QPixmap] = QPixmap(str(MAP_IMAGE)) if MAP_IMAGE.exists() else None
+        self.active_id: Optional[str] = None
+        self.items_by_id: Dict[str, MapTargetItem] = {}
+        for t in targets:
+            item = MapTargetItem(t, projection.target_map_rect(t.rect))
+            self.scene_.addItem(item)
+            self.items_by_id[t.target_id] = item
+
+    def set_active(self, target_id: Optional[str]) -> None:
+        """Highlight one target's box, or none.
+
+        :param target_id: Selected target, or ``None``.
+        :type target_id: str or None
+        """
+        self.active_id = target_id
+        for tid, item in self.items_by_id.items():
+            item.set_active(tid == target_id)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        """Scale the whole map to fit the view, keeping its aspect ratio.
+
+        :param event: Qt resize event.
+        :type event: QResizeEvent
+        """
+        super().resizeEvent(event)
+        self.fitInView(self.sceneRect(), Qt.KeepAspectRatio)
+
+    def drawBackground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802 (Qt naming)
+        """Draw the map image, or a dark grid with the camera view outline if it is missing.
+
+        :param painter: Scene painter.
+        :type painter: QPainter
+        :param rect: Exposed area.
+        :type rect: QRectF
+        """
+        painter.fillRect(rect, QColor("#15191c"))
+        if self._map is not None:
+            painter.drawPixmap(self.sceneRect(), self._map, QRectF(self._map.rect()))
+            return
+        painter.fillRect(self.sceneRect(), QColor("#1f2a22"))
+        painter.setPen(QPen(QColor(255, 255, 255, 18), 1))
+        width, height = self.projection.map_size
+        for x in range(0, int(width), 40):
+            painter.drawLine(x, 0, x, int(height))
+        for y in range(0, int(height), 40):
+            painter.drawLine(0, y, int(width), y)
+        painter.setPen(QPen(QColor(COLORS["bbox"]), 1.5))
+        painter.drawPolygon(QPolygonF([QPointF(x, y) for x, y in self.projection.frustum()]))
 
 
 def segment_path(center: QPointF, r_in: float, r_out: float, start_deg: float, sweep_deg: float) -> QPainterPath:
@@ -405,6 +530,10 @@ class RadialMenuView(QGraphicsView, MenuUI):
         )
         return value if ok else None
 
+    def refresh(self) -> None:
+        """Redraw the menu mid-click, e.g. to show a candidate slot before its dropdown."""
+        self.rebuild()
+
     def show_message(self, text: str, modal: bool = False) -> None:
         """Show a status line, or a dialog if ``modal`` is set.
 
@@ -474,15 +603,20 @@ class RadialMenuView(QGraphicsView, MenuUI):
                 self.style_,
                 center_radius=max(self.style_.center_radius, math.hypot(w, h) / 2.0 + 4.0),
             )
-            fan_center = 90.0
+            angles_of: Dict[MenuNode, Sequence[float]] = {}
             for ring in ctrl.rings():
                 radii = ring_radii(ring.level, style)
-                layout = ring_fan(len(ring.nodes), ring.level, fan_center, style)
-                next_center = fan_center
+                n = len(ring.nodes)
+                parent_angles = angles_of.get(ring.parent)
+                if ring.parent.align_children and parent_angles is not None:
+                    layout = ring_span(n, ring.level, *parent_angles, style)
+                else:
+                    fan_center = 90.0 if parent_angles is None else parent_angles[0] + parent_angles[1] / 2.0
+                    layout = ring_fan(n, ring.level, fan_center, style)
                 for node, angles in zip(ring.nodes, layout):
+                    angles_of[node] = angles
                     if ctrl.is_open(node):
                         state = "open"
-                        next_center = angles[0] + angles[1] / 2.0
                     elif node.is_selected(ctrl.ctx):
                         state = "selected"
                     else:
@@ -493,7 +627,6 @@ class RadialMenuView(QGraphicsView, MenuUI):
                     )
                     self.scene_.addItem(seg)
                     self._menu_items.append(seg)
-                fan_center = next_center
         self._on_change()
 
     # -- input ----------------------------------------------------------------
@@ -562,14 +695,15 @@ class RadialMenuView(QGraphicsView, MenuUI):
 
 
 class MainWindow(QMainWindow):
-    """Main window: menu view on the left, mission JSON on the right."""
+    """Main window: top-down map, camera view with the ring menu, and mission JSON."""
 
     def __init__(self) -> None:
         """Build the window layout."""
         super().__init__()
         self.setWindowTitle("TALON ring menu prototype")
+        self.map_view = MapView(DEMO_TARGETS)
         self.view = RadialMenuView(
-            DEMO_TARGETS, STRIKE_DRONES, on_change=self._refresh_json, on_message=self._message
+            DEMO_TARGETS, STRIKE_DRONES, on_change=self._on_view_changed, on_message=self._message
         )
 
         panel = QWidget()
@@ -587,17 +721,19 @@ class MainWindow(QMainWindow):
         layout.addLayout(buttons)
 
         splitter = QSplitter()
+        splitter.addWidget(self.map_view)
         splitter.addWidget(self.view)
         splitter.addWidget(panel)
-        splitter.setSizes([1100, 380])
+        splitter.setSizes([560, 900, 360])
         self.setCentralWidget(splitter)
-        self.resize(1500, 940)
-        self.statusBar().showMessage("Click an ATR bounding box to start.")
+        self.resize(1820, 900)
+        self.statusBar().showMessage("Click an ATR bounding box in the camera view to start.")
         self.view.rebuild()
 
-    def _refresh_json(self) -> None:
-        """Show the current mission dict in the side panel."""
+    def _on_view_changed(self) -> None:
+        """Show the current mission dict and highlight the selected target on the map."""
         self.json_box.setPlainText(json.dumps(self.view.mission_dict(), indent=2))
+        self.map_view.set_active(self.view.active_id)
 
     def _message(self, text: str) -> None:
         """Show a status-bar message.

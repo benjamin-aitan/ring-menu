@@ -11,12 +11,14 @@ from typing import List, Optional, Sequence
 import pytest
 
 from menu_model import (
+    DEFAULT_PROJECTION,
+    AddStrikeDroneNode,
     ClickResult,
-    AssignIsrDroneNode,
     DroneSlotNode,
     StrikeTimingNode,
-    DynamicListNode,
     ExclusiveOptionNode,
+    GroundProjection,
+    IsrModeNode,
     MenuController,
     MenuNode,
     MenuUI,
@@ -26,6 +28,7 @@ from menu_model import (
     build_target_menu,
     fan_layout,
     ring_fan,
+    span_layout,
 )
 
 DRONES = ["S1", "S2", "S3"]
@@ -48,6 +51,9 @@ class FakeUI(MenuUI):
         self.numbers: List[Optional[float]] = []
         self.offered: List[List[str]] = []
         self.messages: List[str] = []
+        #: Called on every :meth:`refresh`, e.g. to inspect state mid-click.
+        self.on_refresh = lambda: None
+        self.refreshes = 0
 
     def choose_from_list(self, node: MenuNode, options: Sequence[str], current: Optional[str]) -> Optional[str]:
         """Record the options and return the next scripted answer.
@@ -80,6 +86,11 @@ class FakeUI(MenuUI):
         """
         return self.numbers.pop(0)
 
+    def refresh(self) -> None:
+        """Count the redraw and run the inspection hook."""
+        self.refreshes += 1
+        self.on_refresh()
+
     def show_message(self, text: str, modal: bool = False) -> None:
         """Record the message.
 
@@ -104,25 +115,22 @@ def make_controller(target_id: str = "T1") -> MenuController:
     return MenuController(build_target_menu(target), ctx)
 
 
-def open_isr_mode(ctrl: MenuController, ui: MenuUI, mode_prefix: str) -> MenuNode:
-    """Open the ISR branch and click one ISR mode.
+def click_isr_mode(ctrl: MenuController, ui: MenuUI, mode_prefix: str) -> MenuNode:
+    """Open ring 1 if needed and click one ISR mode (which opens its dropdown).
 
     :param ctrl: Controller to drive.
     :type ctrl: MenuController
     :param ui: UI passed to the clicks.
     :type ui: MenuUI
-    :param mode_prefix: Label prefix of the mode to click.
+    :param mode_prefix: Label prefix of the mode to click, e.g. ``"ISR Orbit"``.
     :type mode_prefix: str
     :returns: The clicked mode node.
     :rtype: MenuNode
     """
-    isr = child(ctrl.root, ctrl.ctx, "Lock ISR")
     if not ctrl.is_open(ctrl.root):
         ctrl.click(ctrl.root, 0, ui)
-    if not ctrl.is_open(isr):
-        ctrl.click(isr, 1, ui)
-    mode = child(isr, ctrl.ctx, mode_prefix)
-    ctrl.click(mode, 2, ui)
+    mode = child(ctrl.root, ctrl.ctx, mode_prefix)
+    ctrl.click(mode, 1, ui)
     return mode
 
 
@@ -176,32 +184,61 @@ def test_outer_rings_use_smaller_angles() -> None:
     assert outer < inner
 
 
+def test_span_layout_fills_parent_angle_exactly() -> None:
+    """Buttons split a span with outer edges on the span's edges and gaps only between them."""
+    layout = span_layout(2, 30.0, 40.0, gap_deg=4.0)
+    assert layout == [pytest.approx((52.0, 18.0)), pytest.approx((30.0, 18.0))]
+    assert span_layout(1, 30.0, 40.0, gap_deg=4.0) == [(30.0, 40.0)]
+    assert span_layout(0, 30.0, 40.0) == []
+
+
+def test_projection_maps_lower_boxes_nearer() -> None:
+    """A box lower in the camera image is nearer the camera, so lower on the map."""
+    proj = GroundProjection()
+    _, far_y = proj.to_map(700, 300)
+    _, near_y = proj.to_map(700, 600)
+    assert near_y > far_y
+    assert proj.camera()[1] == pytest.approx(proj.map_size[1])
+
+
+def test_projection_keeps_vanishing_lines_parallel() -> None:
+    """Points on one line through the vanishing point share a map x (the road is straight)."""
+    proj = GroundProjection()
+    vx, hy = proj.vanishing_x, proj.horizon_y
+    xs = [proj.to_map(vx + 0.5 * (y - hy), y)[0] for y in (200, 400, 780)]
+    assert xs == pytest.approx([xs[0]] * 3)
+    with pytest.raises(ValueError):
+        proj.to_map(100, hy)
+
+
+def test_demo_targets_fit_on_map_without_overlap() -> None:
+    """Every demo target's map box lies inside the map and no two overlap."""
+    import radial_menu
+
+    width, height = DEFAULT_PROJECTION.map_size
+    rects = [DEFAULT_PROJECTION.target_map_rect(t.rect) for t in radial_menu.DEMO_TARGETS]
+    for x, y, w, h in rects:
+        assert 0 <= x and x + w <= width and 0 <= y and y + h <= height
+    for i, (ax, ay, aw, ah) in enumerate(rects):
+        for bx, by, bw, bh in rects[i + 1:]:
+            assert ax + aw <= bx or bx + bw <= ax or ay + ah <= by or by + bh <= ay
+
+
 # -- model and controller ------------------------------------------------------
 
 
 def test_center_click_toggles_first_ring() -> None:
-    """Clicking the root opens ring 1; clicking again closes it."""
+    """Clicking the root opens ring 1 (the drone actions); clicking again closes it."""
     ctrl = make_controller()
     ui = FakeUI()
     ctrl.click(ctrl.root, 0, ui)
     assert [r.level for r in ctrl.rings()] == [1]
-    assert len(ctrl.rings()[0].nodes) == 3
+    nodes = ctrl.rings()[0].nodes
+    assert [n.label.split("\n")[0] for n in nodes] == ["ISR Hover", "ISR Maintain", "ISR Orbit", "Add strike"]
+    assert all(isinstance(n, IsrModeNode) and n.children(ctrl.ctx) == [] for n in nodes[:3])
+    assert isinstance(nodes[3], AddStrikeDroneNode)
     ctrl.click(ctrl.root, 0, ui)
     assert ctrl.rings() == []
-
-
-def test_opening_sibling_truncates_path() -> None:
-    """Opening a different ring-1 button closes the previous branch."""
-    ctrl = make_controller()
-    ui = FakeUI()
-    ctrl.click(ctrl.root, 0, ui)
-    isr = child(ctrl.root, ctrl.ctx, "Lock ISR")
-    strike = child(ctrl.root, ctrl.ctx, "Set as strike")
-    ctrl.click(isr, 1, ui)
-    assert ctrl.open_path == [ctrl.root, isr]
-    ctrl.click(strike, 1, ui)
-    assert ctrl.open_path == [ctrl.root, strike]
-    assert ctrl.ctx.is_strike_target
 
 
 def test_generic_exclusive_option_toggles_off() -> None:
@@ -215,37 +252,31 @@ def test_generic_exclusive_option_toggles_off() -> None:
     assert ctrl.ctx.isr_mode is None
 
 
-def test_isr_mode_opens_assign_ring_and_switching_keeps_drone() -> None:
-    """Picking a mode opens 'Assign ISR drone'; switching modes keeps the drone."""
+def test_isr_button_assigns_drone_from_dropdown() -> None:
+    """An ISR button opens the drone dropdown at once; picking a drone locks it in that mode."""
     ctrl = make_controller()
-    ui = FakeUI(choices=["I2"])
-    hover = open_isr_mode(ctrl, ui, "Hover")
-    assert ctrl.ctx.isr_mode == "hover_hold"
-    assert ctrl.open_path[-1] is hover
-    assign = ctrl.rings()[-1].nodes[0]
-    assert isinstance(assign, AssignIsrDroneNode)
-    assert assign.display_label(ctrl.ctx) == "Assign\nISR drone"
+    ui = FakeUI(choices=["I2", "I3"])
+    hover = click_isr_mode(ctrl, ui, "ISR Hover")
+    assert ui.offered[0] == ["I1", "I2", "I3"]  # no cancel entry: nothing locked yet
+    assert (ctrl.ctx.isr_mode, ctrl.ctx.isr_drone) == ("hover_hold", "I2")
+    assert hover.is_selected(ctrl.ctx)
+    assert hover.display_label(ctrl.ctx) == "ISR Hover\nand hold\nI2"
+    assert ctrl.open_path == [ctrl.root]  # ISR buttons have no ring of their own
 
-    ctrl.click(assign, 3, ui)
-    assert ui.offered[0] == ["I1", "I2", "I3", AssignIsrDroneNode.CANCEL]
-    assert ctrl.ctx.isr_drone == "I2"
-    assert assign.display_label(ctrl.ctx) == "I2" and assign.is_selected(ctrl.ctx)
-
-    orbit = open_isr_mode(ctrl, ui, "Orbit")
-    assert ctrl.ctx.isr_mode == "orbit" and ctrl.ctx.isr_drone == "I2"
-    assert not hover.is_selected(ctrl.ctx) and hover.children(ctrl.ctx) == []
-    assert ctrl.open_path[-1] is orbit
+    orbit = click_isr_mode(ctrl, ui, "ISR Orbit")  # switching mode takes the new pick
+    assert (ctrl.ctx.isr_mode, ctrl.ctx.isr_drone) == ("orbit", "I3")
+    assert not hover.is_selected(ctrl.ctx) and hover.display_label(ctrl.ctx) == hover.label
+    assert orbit.is_selected(ctrl.ctx)
 
 
-def test_clicking_active_isr_mode_toggles_ring_only() -> None:
-    """Clicking the active mode hides/shows its ring but keeps the mode."""
+def test_dismissed_isr_dropdown_changes_nothing() -> None:
+    """Clicking outside the ISR dropdown leaves the lock as it was."""
     ctrl = make_controller()
-    ui = FakeUI()
-    orbit = open_isr_mode(ctrl, ui, "Orbit")
-    ctrl.click(orbit, 2, ui)
-    assert ctrl.ctx.isr_mode == "orbit" and not ctrl.is_open(orbit)
-    ctrl.click(orbit, 2, ui)
-    assert ctrl.ctx.isr_mode == "orbit" and ctrl.is_open(orbit)
+    ui = FakeUI(choices=["I1", None, None])
+    click_isr_mode(ctrl, ui, "ISR Orbit")
+    click_isr_mode(ctrl, ui, "ISR Orbit")
+    click_isr_mode(ctrl, ui, "ISR Hover")
+    assert (ctrl.ctx.isr_mode, ctrl.ctx.isr_drone) == ("orbit", "I1")
 
 
 def test_isr_drone_on_other_target_is_not_offered() -> None:
@@ -258,52 +289,106 @@ def test_isr_drone_on_other_target_is_not_offered() -> None:
             if kind == "isr" else []
         )
     ui = FakeUI(choices=["I1", "I3"])
-    open_isr_mode(t1, ui, "Hover")
-    t1.click(t1.rings()[-1].nodes[0], 3, ui)
-    open_isr_mode(t2, ui, "Orbit")
-    t2.click(t2.rings()[-1].nodes[0], 3, ui)
-    assert ui.offered[1] == ["I2", "I3", AssignIsrDroneNode.CANCEL]
+    click_isr_mode(t1, ui, "ISR Hover")
+    click_isr_mode(t2, ui, "ISR Orbit")
+    assert ui.offered[1] == ["I2", "I3"]
     assert (t1.ctx.isr_drone, t2.ctx.isr_drone) == ("I1", "I3")
 
 
-def test_cancel_isr_lock_clears_and_collapses() -> None:
-    """Cancel in the dropdown clears mode and drone and closes the empty ring."""
+def test_cancel_isr_lock_only_on_active_mode() -> None:
+    """Only the active mode's dropdown offers cancel; choosing it clears mode and drone."""
     ctrl = make_controller()
-    ui = FakeUI(choices=["I1", AssignIsrDroneNode.CANCEL])
-    open_isr_mode(ctrl, ui, "Maintain")
-    assign = ctrl.rings()[-1].nodes[0]
-    ctrl.click(assign, 3, ui)
-    ctrl.click(assign, 3, ui)
+    ui = FakeUI(choices=["I1", "I1", IsrModeNode.CANCEL])
+    click_isr_mode(ctrl, ui, "ISR Maintain")
+    click_isr_mode(ctrl, ui, "ISR Maintain")
+    assert ui.offered[1] == ["I1", "I2", "I3", IsrModeNode.CANCEL]
+    click_isr_mode(ctrl, ui, "ISR Maintain")
     assert ctrl.ctx.isr_mode is None and ctrl.ctx.isr_drone is None
-    isr = child(ctrl.root, ctrl.ctx, "Lock ISR")
-    assert ctrl.open_path == [ctrl.root, isr]
     assert ctrl.ctx.free_isr_drones() == ISR
 
 
-def test_add_drone_grows_next_ring_and_dropdown_excludes_assigned() -> None:
-    """Each add click adds one slot; a chosen drone is not offered to other slots."""
+def test_add_strike_drone_shows_candidate_then_keeps_assigned_slot() -> None:
+    """Add shows a candidate slot during the dropdown; a picked drone keeps the slot."""
     ctrl = make_controller()
     ui = FakeUI(choices=["S2", "S1"])
-    strike = child(ctrl.root, ctrl.ctx, "Set as strike")
-    add = strike.children(ctrl.ctx)[0]
-    assert isinstance(add, DynamicListNode)
+    add = child(ctrl.root, ctrl.ctx, "Add strike")
+    seen = []
+    ui.on_refresh = lambda: seen.append([n.display_label(ctrl.ctx) for r in ctrl.rings() for n in r.nodes if r.parent is add])
 
     ctrl.click(ctrl.root, 0, ui)
-    ctrl.click(strike, 1, ui)
-    assert ctrl.click(add, 2, ui) is ClickResult.OPEN
-    ctrl.click(add, 2, ui)
-    slots = ctrl.rings()[-1].nodes
-    assert len(slots) == 2 and all(isinstance(s, DroneSlotNode) for s in slots)
+    assert ctrl.click(add, 1, ui) is ClickResult.OPEN
+    assert seen[0] == ["Select\ndrone…"]  # the candidate wedge is drawn next to the dropdown
+    assert ui.offered[0] == ["S1", "S2", "S3"]
+    assert ctrl.ctx.is_strike_target and add.is_selected(ctrl.ctx)
+    assert ctrl.open_path == [ctrl.root, add]
+
+    ctrl.click(add, 1, ui)
+    assert seen[1] == ["S2", "Select\ndrone…"]
+    assert ui.offered[1] == ["S1", "S3"]  # S2 is taken by the first slot
+    slots = next(r.nodes for r in ctrl.rings() if r.parent is add)
+    assert all(isinstance(s, DroneSlotNode) for s in slots)
+    assert [a.drone_id for a in ctrl.ctx.strike_assignments] == ["S2", "S1"]
     assert add.children(ctrl.ctx) == slots  # cached, identical objects
 
-    ctrl.click(slots[0], 3, ui)
-    assert ui.offered[0][:-1] == ["S1", "S2", "S3"]
-    assert ctrl.open_path[-1] is slots[0]  # vector ring opens after choosing
-    assert ctrl.rings()[-1].nodes[1].label.startswith("Strike\nvector")
 
-    ctrl.click(slots[1], 3, ui)
-    assert ui.offered[1][:-1] == ["S1", "S3"]
-    assert [a.drone_id for a in ctrl.ctx.strike_assignments] == ["S2", "S1"]
+def test_dismissed_strike_dropdown_drops_candidate() -> None:
+    """Clicking outside the strike dropdown removes the candidate slot only."""
+    ctrl = make_controller()
+    ui = FakeUI(choices=[None, "S3", None])
+    add = child(ctrl.root, ctrl.ctx, "Add strike")
+    ctrl.click(ctrl.root, 0, ui)
+    assert ctrl.click(add, 1, ui) is ClickResult.CLOSE
+    assert ctrl.ctx.strike_assignments == [] and not ctrl.ctx.is_strike_target
+    assert ctrl.open_path == [ctrl.root]
+
+    ctrl.click(add, 1, ui)
+    ctrl.click(add, 1, ui)  # dismissed: the S3 slot stays, the ring stays open
+    assert [a.drone_id for a in ctrl.ctx.strike_assignments] == ["S3"]
+    assert ctrl.open_path == [ctrl.root, add]
+
+
+def test_slot_options_show_as_soon_as_drone_is_picked() -> None:
+    """Each assigned drone shows its timing and vector buttons with no extra tap."""
+    ctrl = make_controller()
+    ui = FakeUI(choices=["S1", "S2"])
+    add = child(ctrl.root, ctrl.ctx, "Add strike")
+    ctrl.click(ctrl.root, 0, ui)
+    ctrl.click(add, 1, ui)
+    first = add.children(ctrl.ctx)[0]
+    assert first.align_children and first.always_show_children
+    assert [(r.level, r.parent) for r in ctrl.rings()] == [(1, ctrl.root), (2, add), (3, first)]
+    assert [n.label.split("\n")[0] for n in ctrl.rings()[-1].nodes] == ["Strike", "Strike"]
+
+    ctrl.click(add, 1, ui)  # second drone: both slots show their options
+    second = add.children(ctrl.ctx)[1]
+    assert [(r.level, r.parent) for r in ctrl.rings()[2:]] == [(3, first), (3, second)]
+    assert ctrl.open_path == [ctrl.root, add]  # slots never join the open path
+
+
+def test_ringless_taps_keep_strike_rings_open() -> None:
+    """ISR taps, option taps and a dismissed add leave the strike rings on screen."""
+    ctrl = make_controller()
+    ui = FakeUI(choices=["S1", "S2", "I1", None])
+    ui.numbers = [3.0]
+    add = child(ctrl.root, ctrl.ctx, "Add strike")
+    ctrl.click(ctrl.root, 0, ui)
+    ctrl.click(add, 1, ui)
+    ctrl.click(add, 1, ui)
+    shown = [(r.level, r.parent) for r in ctrl.rings()]
+
+    click_isr_mode(ctrl, ui, "ISR Orbit")
+    assert ctrl.ctx.isr_drone == "I1"
+    assert [(r.level, r.parent) for r in ctrl.rings()] == shown
+
+    second = add.children(ctrl.ctx)[1]
+    timing = second.children(ctrl.ctx)[0]
+    ctrl.click(timing, 3, ui)
+    assert ctrl.ctx.strike_assignments[1].delay_s == 3.0
+    assert [(r.level, r.parent) for r in ctrl.rings()] == shown
+
+    ctrl.click(add, 1, ui)  # dismissed: candidate dropped, existing drones kept
+    assert [a.drone_id for a in ctrl.ctx.strike_assignments] == ["S1", "S2"]
+    assert [(r.level, r.parent) for r in ctrl.rings()] == shown
 
 
 def test_strike_timing_sequence_is_configurable() -> None:
@@ -338,21 +423,20 @@ def test_strike_timing_sequence_is_configurable() -> None:
     assert ctx.strike_offsets() == {2: 0.0, 3: 10.0}
 
 
-def test_removing_open_slot_prunes_path() -> None:
-    """Removing a slot whose ring is open closes that ring."""
+def test_removing_slot_drops_its_options() -> None:
+    """Removing a slot removes it and its options; removing the last closes the strike ring."""
     ctrl = make_controller()
     ui = FakeUI(choices=["S1", DroneSlotNode.REMOVE])
-    strike = child(ctrl.root, ctrl.ctx, "Set as strike")
-    add = strike.children(ctrl.ctx)[0]
+    add = child(ctrl.root, ctrl.ctx, "Add strike")
     ctrl.click(ctrl.root, 0, ui)
-    ctrl.click(strike, 1, ui)
-    ctrl.click(add, 2, ui)
+    ctrl.click(add, 1, ui)
     slot = add.children(ctrl.ctx)[0]
-    ctrl.click(slot, 3, ui)
-    assert ctrl.open_path[-1] is slot
-    ctrl.click(slot, 3, ui)
+    assert any(r.parent is slot for r in ctrl.rings())
+    ctrl.click(slot, 2, ui)
     assert ctrl.ctx.strike_assignments == []
-    assert ctrl.open_path[-1] is strike  # the now-empty slot ring collapses too
+    assert not ctrl.ctx.is_strike_target  # no slots left, so no longer a strike target
+    assert ctrl.open_path == [ctrl.root]  # the now-empty slot ring collapses too
+    assert [r.parent for r in ctrl.rings()] == [ctrl.root]
 
 
 def test_to_dict_shape() -> None:
@@ -393,10 +477,18 @@ def test_qt_view_renders_and_saves_screenshot() -> None:
     assert view.active_id == "T2"
     assert view.controllers["T2"].open_path == [view.controllers["T2"].root]
 
+    # The map paints the selected target's box and clears it on deselect.
+    assert window.map_view.active_id == "T2"
+    t2_item = window.map_view.items_by_id["T2"]
+    assert t2_item.pen().color().name() == radial_menu.DEMO_TARGETS[1].color
+    assert window.map_view.items_by_id["T1"].pen().color().name() == radial_menu.COLORS["bbox"]
+    view.select_target(None)
+    assert window.map_view.active_id is None
+    assert t2_item.pen().color().name() == radial_menu.COLORS["bbox"]
+
     view.select_target("T1")
-    view.click_node(child(ctrl.root, ctrl.ctx, "Lock ISR"), 1)
-    view.click_node(child(child(ctrl.root, ctrl.ctx, "Lock ISR"), ctrl.ctx, "Orbit"), 2)
-    view.click_node(ctrl.rings()[-1].nodes[0], 3)  # Assign ISR drone -> ISR-02
+    assert window.map_view.active_id == "T1"
+    view.click_node(child(ctrl.root, ctrl.ctx, "ISR Orbit"), 1)  # dropdown -> ISR-02
     assert view.mission_dict()["targets"]["T1"]["isr_lock"]["drone_id"] == "ISR-02"
     out = radial_menu.OUTPUT_DIR
     out.mkdir(exist_ok=True)
@@ -404,14 +496,19 @@ def test_qt_view_renders_and_saves_screenshot() -> None:
     app.processEvents()
     assert window.grab().save(str(out / "screenshot_isr.png"))
 
-    strike = child(ctrl.root, ctrl.ctx, "Set as strike")
-    view.click_node(strike, 1)
-    add = strike.children(ctrl.ctx)[0]
-    view.click_node(add, 2)
-    view.click_node(add, 2)
+    add = child(ctrl.root, ctrl.ctx, "Add strike")
+    view.click_node(add, 1)  # dropdown -> Strike-02
+    view.click_node(add, 1)  # dropdown -> Strike-04
     slots = add.children(ctrl.ctx)
-    view.click_node(slots[1], 3)
-    view.click_node(slots[0], 3)
+
+    # Every drone's timing/vector buttons show at once, each spanning its slot's angle.
+    segments = {item.node: item for item in view._menu_items}
+    for slot in slots:
+        opts = [segments[n] for n in slot.children(ctrl.ctx)]
+        assert len(opts) == 2 and all(o.level == 3 for o in opts)
+        edges = sorted(a for o in opts for a in (o.angles[0], o.angles[0] + o.angles[1]))
+        start, sweep = segments[slot].angles
+        assert edges[0] == pytest.approx(start) and edges[-1] == pytest.approx(start + sweep)
 
     assert '"Strike-02"' in window.json_box.toPlainText()
     assert view.mission_dict()["targets"]["T1"]["isr_lock"]["mode"] == "orbit"
@@ -441,3 +538,27 @@ def test_scenario_draws_vehicle_in_each_box() -> None:
                 if abs(c.red() - ground.red()) + abs(c.green() - ground.green()) + abs(c.blue() - ground.blue()) > 60:
                     differing += 1
         assert differing > 40, f"no vehicle drawn in {target.target_id}'s box"
+
+
+def test_map_draws_vehicle_in_each_footprint() -> None:
+    """The map image has the projection's size and a vehicle in each target footprint."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    import make_scenario
+    import radial_menu
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841 (keeps Qt alive)
+    image = make_scenario.render_map(radial_menu.DEMO_TARGETS)
+    width, height = DEFAULT_PROJECTION.map_size
+    assert (image.width(), image.height()) == (round(width), round(height))
+    for target in radial_menu.DEMO_TARGETS:
+        x, y, w, h = DEFAULT_PROJECTION.target_footprint(target.rect)
+        ground = image.pixelColor(int(x - 12), int(y + h / 2))
+        differing = 0
+        for px in range(int(x) + 1, int(x + w) - 1, 2):
+            for py in range(int(y) + 1, int(y + h) - 1, 2):
+                c = image.pixelColor(px, py)
+                if abs(c.red() - ground.red()) + abs(c.green() - ground.green()) + abs(c.blue() - ground.blue()) > 60:
+                    differing += 1
+        assert differing > 20, f"no vehicle drawn in {target.target_id}'s map footprint"

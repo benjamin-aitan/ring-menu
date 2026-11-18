@@ -86,7 +86,6 @@ class MissionContext:
     :param available_isr_drones: Shared list of ISR drones that can be assigned.
     :param isr_mode: Selected ISR lock behaviour, or ``None`` if not locked.
     :param isr_drone: ISR drone tasked with the lock, or ``None``.
-    :param is_strike_target: Whether the target is designated for strike.
     :param strike_assignments: Strike-drone slots added by the operator.
     """
 
@@ -95,12 +94,22 @@ class MissionContext:
     available_isr_drones: List[str] = field(default_factory=list)
     isr_mode: Optional[str] = None
     isr_drone: Optional[str] = None
-    is_strike_target: bool = False
     strike_assignments: List[DroneAssignment] = field(default_factory=list)
     _next_slot_id: int = 1
     #: ``drones_taken_elsewhere(kind)`` lists drones of ``kind`` (``"strike"`` or
     #: ``"isr"``) tasked on *other* targets; set by the owner of all contexts.
     drones_taken_elsewhere: Callable[[str], List[str]] = field(default=lambda kind: [], repr=False)
+
+    @property
+    def is_strike_target(self) -> bool:
+        """Return whether the target is designated for strike.
+
+        A target becomes a strike target as soon as it has a strike-drone slot.
+
+        :returns: ``True`` if at least one strike slot exists.
+        :rtype: bool
+        """
+        return bool(self.strike_assignments)
 
     def free_isr_drones(self) -> List[str]:
         """List ISR drones not tasked on any other target.
@@ -276,6 +285,13 @@ class MenuUI:
         """
         raise NotImplementedError
 
+    def refresh(self) -> None:
+        """Redraw the menu now, in the middle of a click.
+
+        Nodes call this to show a change (such as a candidate slot) before
+        asking the operator to choose.  The default does nothing.
+        """
+
     def show_message(self, text: str, modal: bool = False) -> None:
         """Show a message to the operator.
 
@@ -312,6 +328,13 @@ class MenuNode:
     :param icon: Short glyph drawn above the label.
     :type icon: str
     """
+
+    #: If true, the child ring spans exactly this button's angle instead of
+    #: fanning out around its centre.
+    align_children: bool = False
+    #: If true, the child ring is shown whenever this button is visible,
+    #: without the button being opened; it never joins the open path.
+    always_show_children: bool = False
 
     def __init__(self, label: str, icon: str = "") -> None:
         """Initialise the node.
@@ -595,41 +618,56 @@ class SelectFromListNode(MenuNode):
         return ClickResult.OPEN if self.children(ctx) else ClickResult.CLOSE
 
 
-class AssignIsrDroneNode(SelectFromListNode):
-    """Button that assigns an ISR drone to the target's ISR lock via a dropdown.
+class IsrModeNode(SelectFromListNode):
+    """An ISR lock behaviour; clicking it opens a dropdown of ISR drones.
 
-    The dropdown lists ISR drones not tasked on other targets, plus an entry
-    that cancels the lock.
+    Picking a drone locks it on the target in this mode (switching from any
+    other mode).  When this mode is active, the dropdown also offers to cancel
+    the lock.  Dismissing the dropdown changes nothing.
+
+    :param label: Button label.
+    :param value: ISR mode identifier stored in ``ctx.isr_mode``.
+    :param icon: Short glyph drawn above the label.
     """
 
     CANCEL = "✕ Cancel ISR lock"
 
-    def __init__(self) -> None:
-        """Initialise the button."""
-        super().__init__("Assign\nISR drone", icon="◉")
+    def __init__(self, label: str, value: str, icon: str = "") -> None:
+        """Initialise the mode button.
+
+        :param label: Button label.
+        :type label: str
+        :param value: ISR mode identifier.
+        :type value: str
+        :param icon: Short glyph drawn above the label.
+        :type icon: str
+        """
+        super().__init__(label, icon)
+        self.value = value
 
     def options(self, ctx: MissionContext) -> List[str]:
-        """Offer free ISR drones plus a cancel-lock entry.
+        """Offer free ISR drones, plus a cancel entry if this mode is active.
 
         :param ctx: Current mission state.
         :type ctx: MissionContext
-        :returns: ISR drone identifiers followed by :attr:`CANCEL`.
+        :returns: ISR drone identifiers, then :attr:`CANCEL` when active.
         :rtype: list[str]
         """
-        return ctx.free_isr_drones() + [self.CANCEL]
+        options = ctx.free_isr_drones()
+        return options + [self.CANCEL] if self.is_selected(ctx) else options
 
     def current(self, ctx: MissionContext) -> Optional[str]:
-        """Return the ISR drone tasked with the lock.
+        """Return the ISR drone locked in this mode.
 
         :param ctx: Current mission state.
         :type ctx: MissionContext
-        :returns: The assigned ISR drone, or ``None``.
+        :returns: The locked drone if this mode is active, else ``None``.
         :rtype: str or None
         """
-        return ctx.isr_drone
+        return ctx.isr_drone if self.is_selected(ctx) else None
 
     def apply_choice(self, ctx: MissionContext, choice: str) -> None:
-        """Assign the chosen ISR drone, or cancel the lock.
+        """Lock the chosen drone in this mode, or cancel the lock.
 
         :param ctx: Current mission state.
         :type ctx: MissionContext
@@ -639,92 +677,47 @@ class AssignIsrDroneNode(SelectFromListNode):
         if choice == self.CANCEL:
             ctx.cancel_isr_lock()
         else:
+            ctx.isr_mode = self.value
             ctx.isr_drone = choice
 
+    def on_click(self, ctx: MissionContext, ui: MenuUI) -> ClickResult:
+        """Show the ISR drone dropdown and apply the choice.
+
+        :param ctx: Current mission state.
+        :type ctx: MissionContext
+        :param ui: UI callbacks.
+        :type ui: MenuUI
+        :returns: :attr:`ClickResult.CLOSE` (the button has no ring).
+        :rtype: ClickResult
+        """
+        result = super().on_click(ctx, ui)
+        if ctx.isr_mode is None:
+            ui.show_message("ISR lock cancelled")
+        elif self.is_selected(ctx):
+            ui.show_message(f"ISR lock: {self.value} with {ctx.isr_drone}")
+        return result
+
     def display_label(self, ctx: MissionContext) -> str:
-        """Show the assigned drone, or the assign prompt.
+        """Show the mode, plus the locked drone when active.
 
         :param ctx: Current mission state.
         :type ctx: MissionContext
         :returns: Label text.
         :rtype: str
         """
-        return ctx.isr_drone or self.label
+        if self.is_selected(ctx) and ctx.isr_drone:
+            return f"{self.label}\n{ctx.isr_drone}"
+        return self.label
 
     def is_selected(self, ctx: MissionContext) -> bool:
-        """Drawn as selected once a drone is assigned.
+        """Return whether this is the active ISR mode.
 
         :param ctx: Current mission state.
         :type ctx: MissionContext
-        :returns: ``True`` if an ISR drone is assigned.
+        :returns: ``True`` if ``ctx.isr_mode == value``.
         :rtype: bool
         """
-        return ctx.isr_drone is not None
-
-
-class IsrModeNode(ExclusiveOptionNode):
-    """An ISR lock behaviour; once selected, its ring offers drone assignment.
-
-    Unlike :class:`ExclusiveOptionNode`, clicking the active mode does not clear
-    it; it only shows or hides the assign-drone ring.  The lock is cancelled
-    from the assign-drone dropdown.  Switching modes keeps the assigned drone.
-
-    :param label: Button label.
-    :param value: ISR mode identifier stored in ``ctx.isr_mode``.
-    :param assign_node: Shared assign-drone button shown as the only child.
-    :param icon: Short glyph drawn above the label.
-    """
-
-    def __init__(self, label: str, value: str, assign_node: MenuNode, icon: str = "") -> None:
-        """Initialise the mode button.
-
-        :param label: Button label.
-        :type label: str
-        :param value: ISR mode identifier.
-        :type value: str
-        :param assign_node: Shared assign-drone button.
-        :type assign_node: MenuNode
-        :param icon: Short glyph drawn above the label.
-        :type icon: str
-        """
-        super().__init__(label, "isr_mode", value, icon=icon)
-        self._assign_node = assign_node
-
-    def run(self, ctx: MissionContext, ui: MenuUI) -> None:
-        """Select this mode.
-
-        :param ctx: Current mission state.
-        :type ctx: MissionContext
-        :param ui: UI callbacks.
-        :type ui: MenuUI
-        """
-        ctx.isr_mode = self.value
-        ui.show_message(f"isr_mode = {self.value}")
-
-    def on_click(self, ctx: MissionContext, ui: MenuUI) -> ClickResult:
-        """Select the mode and open its ring; toggle the ring if already active.
-
-        :param ctx: Current mission state.
-        :type ctx: MissionContext
-        :param ui: UI callbacks.
-        :type ui: MenuUI
-        :returns: :attr:`ClickResult.TOGGLE` if the mode was already active,
-            otherwise :attr:`ClickResult.OPEN`.
-        :rtype: ClickResult
-        """
-        was_selected = self.is_selected(ctx)
-        self.run(ctx, ui)
-        return ClickResult.TOGGLE if was_selected else ClickResult.OPEN
-
-    def children(self, ctx: MissionContext) -> List[MenuNode]:
-        """Show the assign-drone button while this mode is active.
-
-        :param ctx: Current mission state.
-        :type ctx: MissionContext
-        :returns: ``[assign_node]`` if selected, else ``[]``.
-        :rtype: list[MenuNode]
-        """
-        return [self._assign_node] if self.is_selected(ctx) else []
+        return ctx.isr_mode == self.value
 
 
 class StrikeVectorNode(ActionNode):
@@ -828,6 +821,8 @@ class DroneSlotNode(SelectFromListNode):
     """
 
     REMOVE = "✕ Remove this slot"
+    align_children = True
+    always_show_children = True
 
     def __init__(self, slot_id: int) -> None:
         """Initialise the slot button.
@@ -907,74 +902,68 @@ class DroneSlotNode(SelectFromListNode):
         return self.current(ctx) is not None
 
 
-class DynamicListNode(MenuNode):
-    """A button whose every click adds one more item to its child ring.
+class AddStrikeDroneNode(SelectFromListNode):
+    """Button that adds a strike drone through a dropdown.
 
-    Child nodes are cached by key so they stay the same objects across clicks,
-    which keeps the controller's open path valid.
+    A click adds a candidate slot, redraws so it shows in the slot ring, then
+    opens a dropdown of free strike drones.  Picking one keeps the slot with
+    that drone; dismissing the dropdown removes the candidate again.
 
-    :param label: Button label.
-    :param add_item: Callback that adds an item to the context and returns its key.
-    :param item_keys: Callback returning the keys of the current items, in order.
-    :param make_node: Factory creating the child node for a key.
-    :param icon: Short glyph drawn above the label.
+    The ring shows one :class:`DroneSlotNode` per slot.  Slot nodes are cached
+    by slot id so they stay the same objects, which keeps the controller's
+    open path valid.
     """
 
-    def __init__(
-        self,
-        label: str,
-        add_item: Callable[[MissionContext], int],
-        item_keys: Callable[[MissionContext], List[int]],
-        make_node: Callable[[int], MenuNode],
-        icon: str = "",
-    ) -> None:
-        """Initialise the list button.
-
-        :param label: Button label.
-        :type label: str
-        :param add_item: Adds an item to the context and returns its key.
-        :type add_item: Callable[[MissionContext], int]
-        :param item_keys: Returns the keys of the current items, in order.
-        :type item_keys: Callable[[MissionContext], list[int]]
-        :param make_node: Creates the child node for a key.
-        :type make_node: Callable[[int], MenuNode]
-        :param icon: Short glyph drawn above the label.
-        :type icon: str
-        """
-        super().__init__(label, icon)
-        self._add_item = add_item
-        self._item_keys = item_keys
-        self._make_node = make_node
-        self._cache: Dict[int, MenuNode] = {}
+    def __init__(self) -> None:
+        """Initialise the button."""
+        super().__init__("Add strike\ndrone", icon="＋")
+        self._cache: Dict[int, DroneSlotNode] = {}
 
     def children(self, ctx: MissionContext) -> List[MenuNode]:
-        """Return one cached child node per current item.
+        """Return one cached slot button per strike slot.
 
         :param ctx: Current mission state.
         :type ctx: MissionContext
-        :returns: Child nodes in item order.
+        :returns: Slot nodes in strike order.
         :rtype: list[MenuNode]
         """
-        nodes = []
-        for key in self._item_keys(ctx):
-            if key not in self._cache:
-                self._cache[key] = self._make_node(key)
-            nodes.append(self._cache[key])
+        nodes: List[MenuNode] = []
+        for a in ctx.strike_assignments:
+            if a.slot_id not in self._cache:
+                self._cache[a.slot_id] = DroneSlotNode(a.slot_id)
+            nodes.append(self._cache[a.slot_id])
         return nodes
 
     def on_click(self, ctx: MissionContext, ui: MenuUI) -> ClickResult:
-        """Add one item and keep the child ring open.
+        """Add a candidate slot, ask for its drone, and keep or drop it.
 
         :param ctx: Current mission state.
         :type ctx: MissionContext
         :param ui: UI callbacks.
         :type ui: MenuUI
-        :returns: :attr:`ClickResult.OPEN`.
+        :returns: :attr:`ClickResult.OPEN` while any slot exists, else
+            :attr:`ClickResult.CLOSE`.
         :rtype: ClickResult
         """
-        self._add_item(ctx)
-        ui.show_message(f"{self.label.replace(chr(10), ' ')}: {len(self._item_keys(ctx))} item(s)")
-        return ClickResult.OPEN
+        slot = ctx.add_slot()
+        ui.refresh()
+        choice = ui.choose_from_list(self, ctx.free_drones(for_slot_id=slot.slot_id), None)
+        if choice is None:
+            ctx.remove_slot(slot.slot_id)
+        else:
+            slot.drone_id = choice
+            ui.show_message(f"Strike drone added: {choice}")
+        return ClickResult.OPEN if self.children(ctx) else ClickResult.CLOSE
+
+    def is_selected(self, ctx: MissionContext) -> bool:
+        """Drawn as selected once the target has strike drones.
+
+        :param ctx: Current mission state.
+        :type ctx: MissionContext
+        :returns: ``True`` if the target is a strike target.
+        :rtype: bool
+        """
+        return ctx.is_strike_target
 
 
 # ---------------------------------------------------------------------------
@@ -982,69 +971,24 @@ class DynamicListNode(MenuNode):
 # ---------------------------------------------------------------------------
 
 
-def _show_geolocation(ctx: MissionContext, ui: MenuUI) -> None:
-    """Show the target's geolocation (stub for the global-map view).
-
-    :param ctx: Current mission state.
-    :type ctx: MissionContext
-    :param ui: UI callbacks.
-    :type ui: MenuUI
-    """
-    t = ctx.target
-    ui.show_message(
-        f"{t.target_id} ({t.label})\nlat {t.lat:.5f}, lon {t.lon:.5f}\n\n"
-        "(Global map view not implemented yet.)",
-        modal=True,
-    )
-
-
-def _set_strike_target(ctx: MissionContext) -> None:
-    """Mark the target as a strike target.
-
-    :param ctx: Current mission state.
-    :type ctx: MissionContext
-    """
-    ctx.is_strike_target = True
-
-
 def build_target_menu(target: Target) -> MenuNode:
     """Build the radial menu tree for an ATR target.
 
+    Ring 1 holds the drone actions: the three ISR lock modes, each assigning
+    an ISR drone from a dropdown, and adding a strike drone.
+
     :param target: The target the menu acts on.
     :type target: Target
-    :returns: Root node, drawn as the centre circle.
+    :returns: Root node, which represents the selected target.
     :rtype: MenuNode
     """
-    assign_isr = AssignIsrDroneNode()
-    isr_modes = [
-        IsrModeNode("Hover\nand hold", "hover_hold", assign_isr, icon="⏸"),
-        IsrModeNode("Maintain\ndist/heading", "maintain_distance_heading", assign_isr, icon="⇢"),
-        IsrModeNode("Orbit\ntarget", "orbit", assign_isr, icon="⟳"),
-    ]
-    add_drone = DynamicListNode(
-        "Add strike\ndrone",
-        add_item=lambda ctx: ctx.add_slot().slot_id,
-        item_keys=lambda ctx: [a.slot_id for a in ctx.strike_assignments],
-        make_node=DroneSlotNode,
-        icon="＋",
-    )
     return GroupNode(
         target.target_id,
         children=[
-            ActionNode("Show\ngeolocation", _show_geolocation, icon="⌖"),
-            GroupNode(
-                "Lock ISR\non target",
-                isr_modes,
-                icon="◎",
-                selected_when=lambda ctx: ctx.isr_mode is not None,
-            ),
-            GroupNode(
-                "Set as strike\ntarget",
-                [add_drone],
-                icon="✸",
-                on_open=_set_strike_target,
-                selected_when=lambda ctx: ctx.is_strike_target,
-            ),
+            IsrModeNode("ISR Hover\nand hold", "hover_hold", icon="⏸"),
+            IsrModeNode("ISR Maintain\ndist/heading", "maintain_distance_heading", icon="⇢"),
+            IsrModeNode("ISR Orbit\ntarget", "orbit", icon="⟳"),
+            AddStrikeDroneNode(),
         ],
     )
 
@@ -1108,16 +1052,27 @@ class MenuController:
         self.open_path = valid
 
     def rings(self) -> List[Ring]:
-        """Return the rings that should be visible, innermost first.
+        """Return the rings that should be visible.
 
-        :returns: One :class:`Ring` per open node.
+        One ring per open node, innermost first, followed by the rings of
+        visible nodes that always show their children.  Several rings may
+        share a level; a parent's ring always comes before its child rings.
+
+        :returns: The visible rings.
         :rtype: list[Ring]
         """
         self._prune()
-        return [
+        rings = [
             Ring(level=i + 1, parent=node, nodes=node.children(self.ctx))
             for i, node in enumerate(self.open_path)
         ]
+        for ring in rings:  # grows while iterating, so nested always-shown rings work too
+            for node in ring.nodes:
+                if node.always_show_children and node not in self.open_path:
+                    children = node.children(self.ctx)
+                    if children:
+                        rings.append(Ring(level=ring.level + 1, parent=node, nodes=children))
+        return rings
 
     def is_open(self, node: MenuNode) -> bool:
         """Return whether a node's child ring is open.
@@ -1142,11 +1097,21 @@ class MenuController:
         :rtype: ClickResult
         """
         was_open = len(self.open_path) > level and self.open_path[level] is node
+        saved = list(self.open_path)
+        if len(self.open_path) >= level and not node.always_show_children:
+            # Show this node's ring while it handles the click, in case it redraws
+            # mid-click (e.g. to show a candidate slot next to its dropdown).
+            self.open_path = self.open_path[:level] + [node]
         result = node.on_click(self.ctx, ui)
-        del self.open_path[level:]
-        if result is ClickResult.OPEN or (result is ClickResult.TOGGLE and not was_open):
-            if node.children(self.ctx):
-                self.open_path.append(node)
+        if result is ClickResult.CLOSE and not was_open and not node.children(self.ctx):
+            # A button without a ring (ISR mode, strike option, dismissed add)
+            # leaves the other rings as they were.
+            self.open_path = saved
+        else:
+            del self.open_path[level:]
+            if result is ClickResult.OPEN or (result is ClickResult.TOGGLE and not was_open):
+                if node.children(self.ctx) and not node.always_show_children:
+                    self.open_path.append(node)
         self._prune()
         return result
 
@@ -1247,6 +1212,55 @@ def ring_fan(n: int, level: int, center_deg: float, style: RingStyle) -> List[Tu
     return fan_layout(n, center_deg, max_sweep, gap)
 
 
+def span_layout(n: int, start_deg: float, sweep_deg: float, gap_deg: float = 0.0) -> List[Tuple[float, float]]:
+    """Split an angular span into ``n`` equal buttons that fill it exactly.
+
+    The outer edges of the first and last button match the span's edges; the
+    gap is only left between neighbouring buttons.  Buttons are returned in
+    clockwise order, like :func:`fan_layout`.
+
+    :param n: Number of buttons.
+    :type n: int
+    :param start_deg: Start angle of the span (counter-clockwise from 3 o'clock).
+    :type start_deg: float
+    :param sweep_deg: Angular width of the span (positive).
+    :type sweep_deg: float
+    :param gap_deg: Angle left empty between neighbouring buttons.
+    :type gap_deg: float
+    :returns: ``(start_deg, sweep_deg)`` per button.
+    :rtype: list[tuple[float, float]]
+    """
+    if n <= 0:
+        return []
+    gap = min(gap_deg, sweep_deg / n / 2.0) if n > 1 else 0.0
+    each = (sweep_deg - gap * (n - 1)) / n
+    left_edge = start_deg + sweep_deg
+    return [(left_edge - i * (each + gap) - each, each) for i in range(n)]
+
+
+def ring_span(
+    n: int, level: int, start_deg: float, sweep_deg: float, style: RingStyle
+) -> List[Tuple[float, float]]:
+    """Lay out ``n`` buttons of a ring inside a parent button's angle.
+
+    :param n: Number of buttons.
+    :type n: int
+    :param level: Ring number, 1 for the innermost ring.
+    :type level: int
+    :param start_deg: Start angle of the parent button.
+    :type start_deg: float
+    :param sweep_deg: Angular width of the parent button.
+    :type sweep_deg: float
+    :param style: Layout sizes (``gap_px`` sets the gap between buttons).
+    :type style: RingStyle
+    :returns: ``(start_deg, sweep_deg)`` per button.
+    :rtype: list[tuple[float, float]]
+    """
+    r_in, r_out = ring_radii(level, style)
+    gap = math.degrees(style.gap_px / ((r_in + r_out) / 2.0))
+    return span_layout(n, start_deg, sweep_deg, gap)
+
+
 def polar_to_xy(cx: float, cy: float, radius: float, angle_deg: float) -> Tuple[float, float]:
     """Convert a polar position to screen coordinates (y axis pointing down).
 
@@ -1263,3 +1277,190 @@ def polar_to_xy(cx: float, cy: float, radius: float, angle_deg: float) -> Tuple[
     """
     a = math.radians(angle_deg)
     return cx + radius * math.cos(a), cy - radius * math.sin(a)
+
+
+# ---------------------------------------------------------------------------
+# Camera image -> top-down map projection (pure functions)
+# ---------------------------------------------------------------------------
+
+Rect = Tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
+class GroundProjection:
+    """Map ground points in the oblique camera image onto a top-down map.
+
+    Uses a pinhole camera over flat ground: an image row ``y`` below the
+    horizon lies at depth ``near_dy**2 / (y - horizon_y)`` and an image column
+    ``x`` at lateral offset ``(x - vanishing_x) * near_dy / (y - horizon_y)``,
+    where ``near_dy = near_y - horizon_y``.  World units equal image pixels at
+    the bottom edge of the image.  Lines through the vanishing point (the road)
+    become parallel lines on the map.
+
+    The map shows the world window ``lateral_range`` by ``[0, depth(far_y)]``,
+    with the camera at depth 0 on the bottom edge and far ground at the top.
+
+    :param horizon_y: Image row of the horizon.
+    :param vanishing_x: Image column of the vanishing point.
+    :param near_y: Image row of the bottom edge (nearest visible ground).
+    :param far_y: Farthest image row shown on the map.
+    :param image_width: Width of the camera image in pixels.
+    :param lateral_range: ``(min, max)`` lateral world extent shown on the map.
+    :param map_scale: Map pixels per world unit.
+    :param footprint_aspect: Footprint depth as a fraction of its width.
+    :param padding: Margin added around target footprints, in map pixels.
+    """
+
+    horizon_y: float = 90.0
+    vanishing_x: float = 760.0
+    near_y: float = 780.0
+    far_y: float = 230.0
+    image_width: float = 1200.0
+    lateral_range: Tuple[float, float] = (-2200.0, 1600.0)
+    map_scale: float = 0.2
+    footprint_aspect: float = 0.5
+    padding: float = 4.0
+
+    @property
+    def near_dy(self) -> float:
+        """Return the image height between the horizon and the bottom edge.
+
+        :returns: ``near_y - horizon_y`` in pixels.
+        :rtype: float
+        """
+        return self.near_y - self.horizon_y
+
+    @property
+    def max_depth(self) -> float:
+        """Return the world depth shown at the top edge of the map.
+
+        :returns: Depth of image row ``far_y``.
+        :rtype: float
+        """
+        return self.near_dy ** 2 / (self.far_y - self.horizon_y)
+
+    @property
+    def map_size(self) -> Tuple[float, float]:
+        """Return the size of the map in map pixels.
+
+        :returns: ``(width, height)``.
+        :rtype: tuple[float, float]
+        """
+        lo, hi = self.lateral_range
+        return (hi - lo) * self.map_scale, self.max_depth * self.map_scale
+
+    def to_world(self, x: float, y: float) -> Tuple[float, float]:
+        """Project an image point on the ground to world coordinates.
+
+        :param x: Image column.
+        :type x: float
+        :param y: Image row; must be below the horizon.
+        :type y: float
+        :returns: ``(lateral, depth)`` in world units.
+        :rtype: tuple[float, float]
+        :raises ValueError: If ``y`` is on or above the horizon.
+        """
+        dy = y - self.horizon_y
+        if dy <= 0:
+            raise ValueError(f"image row {y} is not below the horizon at {self.horizon_y}")
+        return (x - self.vanishing_x) * self.near_dy / dy, self.near_dy ** 2 / dy
+
+    def world_to_map(self, lateral: float, depth: float) -> Tuple[float, float]:
+        """Convert world coordinates to map pixels.
+
+        :param lateral: Lateral offset in world units (positive is right).
+        :type lateral: float
+        :param depth: Distance from the camera in world units.
+        :type depth: float
+        :returns: ``(x, y)`` in map pixels, y pointing down.
+        :rtype: tuple[float, float]
+        """
+        return (
+            (lateral - self.lateral_range[0]) * self.map_scale,
+            (self.max_depth - depth) * self.map_scale,
+        )
+
+    def to_map(self, x: float, y: float) -> Tuple[float, float]:
+        """Project an image point on the ground straight to map pixels.
+
+        :param x: Image column.
+        :type x: float
+        :param y: Image row; must be below the horizon.
+        :type y: float
+        :returns: ``(x, y)`` in map pixels.
+        :rtype: tuple[float, float]
+        :raises ValueError: If ``y`` is on or above the horizon.
+        """
+        return self.world_to_map(*self.to_world(x, y))
+
+    def size_scale(self, y: float) -> float:
+        """Return the scene's size factor for an object whose base is at row ``y``.
+
+        This is the factor the cartoon scene uses to shrink objects with
+        distance: about 0.25 at the horizon and 1.0 at the bottom edge.
+
+        :param y: Image row of the object's base.
+        :type y: float
+        :returns: Size factor.
+        :rtype: float
+        """
+        t = max(0.0, (y - self.horizon_y) / self.near_dy)
+        return 0.25 + 0.75 * t
+
+    def camera(self) -> Tuple[float, float]:
+        """Return the camera (drone) position on the map.
+
+        :returns: ``(x, y)`` in map pixels.
+        :rtype: tuple[float, float]
+        """
+        return self.world_to_map(0.0, 0.0)
+
+    def frustum(self) -> List[Tuple[float, float]]:
+        """Return the ground area visible in the camera image, on the map.
+
+        :returns: Near-left, far-left, far-right and near-right corners in map pixels.
+        :rtype: list[tuple[float, float]]
+        """
+        return [
+            self.to_map(0.0, self.near_y),
+            self.to_map(0.0, self.far_y),
+            self.to_map(self.image_width, self.far_y),
+            self.to_map(self.image_width, self.near_y),
+        ]
+
+    def target_footprint(self, rect: Rect) -> Rect:
+        """Return the ground footprint of an ATR box on the map.
+
+        The bottom edge of the box is where the vehicle touches the ground, so
+        its centre fixes the position.  The width is the box width divided by
+        the scene's size factor; vehicles are seen side-on, so the footprint
+        extends away from the camera (up on the map) by ``footprint_aspect``
+        of its width.
+
+        :param rect: ATR box ``(x, y, w, h)`` in image pixels.
+        :type rect: tuple[float, float, float, float]
+        :returns: ``(x, y, w, h)`` in map pixels.
+        :rtype: tuple[float, float, float, float]
+        """
+        x, y, w, h = rect
+        bottom = y + h
+        mx, my = self.to_map(x + w / 2.0, bottom)
+        width = w / self.size_scale(bottom) * self.map_scale
+        depth = width * self.footprint_aspect
+        return mx - width / 2.0, my - depth, width, depth
+
+    def target_map_rect(self, rect: Rect) -> Rect:
+        """Return the box drawn around a target on the map.
+
+        :param rect: ATR box ``(x, y, w, h)`` in image pixels.
+        :type rect: tuple[float, float, float, float]
+        :returns: Padded footprint ``(x, y, w, h)`` in map pixels.
+        :rtype: tuple[float, float, float, float]
+        """
+        x, y, w, h = self.target_footprint(rect)
+        p = self.padding
+        return x - p, y - p, w + 2 * p, h + 2 * p
+
+
+#: Projection matching the demo scene drawn by ``make_scenario.py``.
+DEFAULT_PROJECTION = GroundProjection()

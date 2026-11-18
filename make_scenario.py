@@ -1,18 +1,24 @@
 """Render a simple cartoon ISR scene with the demo targets (tank, truck, APC).
 
-The scene is seen from an oblique drone viewpoint: a horizon near the top,
-a ground plane, a road running towards a vanishing point, and trees and
-buildings that shrink with distance.  Each vehicle is drawn inside its
-target's ATR bounding box from ``radial_menu.DEMO_TARGETS``, so the boxes in
-the menu demo line up with the vehicles.
+Two images of the same scene are produced:
 
-Run with ``.venv/bin/python make_scenario.py``; writes ``inputs/scenario.png``.
+* ``inputs/scenario.png``: the oblique drone camera view, with a horizon near
+  the top, a ground plane, a road running towards a vanishing point, and trees
+  and buildings that shrink with distance.  Each vehicle is drawn inside its
+  target's ATR bounding box from ``radial_menu.DEMO_TARGETS``, so the boxes in
+  the menu demo line up with the vehicles.
+* ``inputs/map.png``: a top-down map of the same ground, built with
+  :class:`menu_model.GroundProjection` so every object sits where the camera
+  view puts it.
+
+Run with ``.venv/bin/python make_scenario.py``.
 """
 
 from __future__ import annotations
 
 import random
 import sys
+import dataclasses
 from pathlib import Path
 from typing import Callable, Dict, Sequence, Tuple
 
@@ -24,18 +30,28 @@ from PySide6.QtGui import (
     QImage,
     QLinearGradient,
     QPainter,
+    QPainterPath,
     QPen,
     QPolygonF,
 )
 
-from menu_model import Target
+from menu_model import DEFAULT_PROJECTION, GroundProjection, Target
 
 HERE = Path(__file__).resolve().parent
 SCENARIO_PATH = HERE / "inputs" / "scenario.png"
+MAP_PATH = HERE / "inputs" / "map.png"
 
-HORIZON_Y = 90.0
-VANISHING_POINT = (760.0, HORIZON_Y)
+HORIZON_Y = DEFAULT_PROJECTION.horizon_y
+VANISHING_POINT = (DEFAULT_PROJECTION.vanishing_x, HORIZON_Y)
 ROAD_BOTTOM = (560.0, 360.0)  # centre x and width at the bottom edge
+
+#: Trees and buildings as ``(kind, x, base_y)`` in camera-image pixels.
+SCENERY = [
+    ("building", 470, 128), ("building", 560, 122), ("building", 150, 420),
+    ("tree", 300, 160), ("tree", 640, 170), ("tree", 1130, 175), ("tree", 1050, 300),
+    ("tree", 110, 250), ("tree", 240, 330), ("tree", 560, 420), ("tree", 1100, 470),
+    ("tree", 90, 640), ("tree", 330, 720), ("tree", 1050, 720), ("tree", 980, 610),
+]
 
 Pt = Tuple[float, float]
 
@@ -302,8 +318,7 @@ def depth_scale(y: float, height: float) -> float:
     :returns: About 0.25 at the horizon, 1.0 at the bottom edge.
     :rtype: float
     """
-    t = max(0.0, (y - HORIZON_Y) / (height - HORIZON_Y))
-    return 0.25 + 0.75 * t
+    return dataclasses.replace(DEFAULT_PROJECTION, near_y=height).size_scale(y)
 
 
 def road_edges(y: float, height: float) -> Tuple[float, float]:
@@ -452,14 +467,8 @@ def render_scenario(targets: Sequence[Target], size: Tuple[float, float]) -> QIm
     painter.setRenderHint(QPainter.Antialiasing)
     draw_ground(painter, width, height)
 
-    scenery = [
-        ("building", 470, 128), ("building", 560, 122), ("building", 150, 420),
-        ("tree", 300, 160), ("tree", 640, 170), ("tree", 1130, 175), ("tree", 1050, 300),
-        ("tree", 110, 250), ("tree", 240, 330), ("tree", 560, 420), ("tree", 1100, 470),
-        ("tree", 90, 640), ("tree", 330, 720), ("tree", 1050, 720), ("tree", 980, 610),
-    ]
     vehicles = [(t.rect[1] + t.rect[3], "vehicle", t) for t in targets]
-    items = [(y, kind, (x, y)) for kind, x, y in scenery] + vehicles
+    items = [(y, kind, (x, y)) for kind, x, y in SCENERY] + vehicles
     # Painter's algorithm: draw from far (top) to near (bottom).
     for y, kind, payload in sorted(items, key=lambda item: item[0]):
         if kind == "tree":
@@ -472,8 +481,264 @@ def render_scenario(targets: Sequence[Target], size: Tuple[float, float]) -> QIm
     return image
 
 
+# ---------------------------------------------------------------------------
+# Top-down map
+# ---------------------------------------------------------------------------
+
+
+def _rect_pts(x: float, y: float, w: float, h: float) -> list:
+    """Return the corners of an axis-aligned rectangle.
+
+    :param x: Left.
+    :type x: float
+    :param y: Top.
+    :type y: float
+    :param w: Width.
+    :type w: float
+    :param h: Height.
+    :type h: float
+    :returns: Four corner points, clockwise from top-left.
+    :rtype: list[tuple[float, float]]
+    """
+    return [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+
+
+def draw_tank_top(painter: QPainter, rect: Tuple[float, float, float, float]) -> None:
+    """Draw a tank seen from above, facing right, filling a footprint.
+
+    :param painter: Active painter.
+    :type painter: QPainter
+    :param rect: ``(x, y, w, h)`` footprint in map pixels.
+    :type rect: tuple[float, float, float, float]
+    """
+    x, y, w, h = rect
+    _shadow(painter, x + w / 2 + 2, y + h / 2 + 2, w * 0.52, h * 0.55)
+    track = 0.24 * h
+    _poly(painter, _rect_pts(x, y, w * 0.86, track), "#26281f")
+    _poly(painter, _rect_pts(x, y + h - track, w * 0.86, track), "#26281f")
+    _poly(painter, _rect_pts(x + 0.02 * w, y + track * 0.7, w * 0.84, h - 1.4 * track), "#6f7a43")
+    cx, cy = x + 0.42 * w, y + h / 2
+    painter.setPen(QPen(QColor("#2c3220"), max(2.0, 0.12 * h), Qt.SolidLine, Qt.RoundCap))
+    painter.drawLine(QPointF(cx, cy), QPointF(x + w, cy))
+    painter.setPen(QPen(QColor("#1e2418"), 1.0))
+    painter.setBrush(QBrush(QColor("#8a9358")))
+    painter.drawEllipse(QPointF(cx, cy), 0.2 * w, 0.32 * h)
+
+
+def draw_truck_top(painter: QPainter, rect: Tuple[float, float, float, float]) -> None:
+    """Draw a cargo truck seen from above, facing right, filling a footprint.
+
+    :param painter: Active painter.
+    :type painter: QPainter
+    :param rect: ``(x, y, w, h)`` footprint in map pixels.
+    :type rect: tuple[float, float, float, float]
+    """
+    x, y, w, h = rect
+    _shadow(painter, x + w / 2 + 2, y + h / 2 + 2, w * 0.52, h * 0.5)
+    inset = 0.12 * h
+    _poly(painter, _rect_pts(x, y + inset, 0.68 * w, h - 2 * inset), "#c7b88a")
+    painter.setPen(QPen(QColor(80, 70, 45, 160), 1.0))
+    for fx in (0.23, 0.45):
+        painter.drawLine(QPointF(x + fx * w, y + inset), QPointF(x + fx * w, y + h - inset))
+    _poly(painter, _rect_pts(x + 0.72 * w, y + 1.4 * inset, 0.28 * w, h - 2.8 * inset), "#7f8a4e")
+    _poly(painter, _rect_pts(x + 0.9 * w, y + 1.8 * inset, 0.07 * w, h - 3.6 * inset), "#7f98a8")
+
+
+def draw_apc_top(painter: QPainter, rect: Tuple[float, float, float, float]) -> None:
+    """Draw a wheeled APC seen from above, facing right, filling a footprint.
+
+    :param painter: Active painter.
+    :type painter: QPainter
+    :param rect: ``(x, y, w, h)`` footprint in map pixels.
+    :type rect: tuple[float, float, float, float]
+    """
+    x, y, w, h = rect
+    _shadow(painter, x + w / 2 + 2, y + h / 2 + 2, w * 0.52, h * 0.55)
+    for fx in (0.13, 0.36, 0.62, 0.84):
+        _poly(painter, _rect_pts(x + fx * w - 0.05 * w, y, 0.1 * w, h), "#2a2a28")
+    inset = 0.1 * h
+    _poly(
+        painter,
+        [(x, y + inset), (x + 0.78 * w, y + inset), (x + w, y + h / 2), (x + 0.78 * w, y + h - inset), (x, y + h - inset)],
+        "#a08f5c",
+    )
+    cx, cy = x + 0.42 * w, y + h / 2
+    painter.setPen(QPen(QColor("#2e2a1c"), max(2.0, 0.08 * h), Qt.SolidLine, Qt.RoundCap))
+    painter.drawLine(QPointF(cx, cy), QPointF(cx + 0.36 * w, cy))
+    painter.setPen(QPen(QColor("#1e2418"), 1.0))
+    painter.setBrush(QBrush(QColor("#c0af7c")))
+    painter.drawEllipse(QPointF(cx, cy), 0.12 * w, 0.22 * h)
+
+
+TOP_VEHICLE_DRAWERS: Dict[str, Callable[[QPainter, Tuple[float, float, float, float]], None]] = {
+    "Tank": draw_tank_top,
+    "Truck": draw_truck_top,
+    "APC": draw_apc_top,
+}
+
+
+def draw_map_ground(painter: QPainter, proj: GroundProjection) -> None:
+    """Draw the ground, field boundaries, speckle texture and road from above.
+
+    :param painter: Active painter.
+    :type painter: QPainter
+    :param proj: Camera-to-map projection.
+    :type proj: GroundProjection
+    """
+    width, height = proj.map_size
+    ground = QLinearGradient(0, 0, 0, height)
+    ground.setColorAt(0.0, QColor("#86915e"))
+    ground.setColorAt(1.0, QColor("#6a7845"))
+    painter.fillRect(QRectF(0, 0, width, height), ground)
+
+    # Field furrows: lines through the vanishing point are straight on the map.
+    painter.setPen(QPen(QColor(60, 70, 35, 40), 1.0))
+    lo, hi = proj.lateral_range
+    step = 160.0 * proj.map_scale * 2
+    x = (-lo * proj.map_scale) % step
+    while x < width:
+        painter.drawLine(QPointF(x, 0), QPointF(x, height))
+        x += step
+    # Field boundaries: image rows are lines of constant depth.
+    painter.setPen(QPen(QColor(50, 60, 30, 70), 1.0))
+    for i in range(1, 12):
+        t = (i / 12.0) ** 1.8
+        row = HORIZON_Y + t * proj.near_dy
+        if row > proj.horizon_y:
+            _, my = proj.to_map(0.0, row)
+            if 0 <= my <= height:
+                painter.drawLine(QPointF(0, my), QPointF(width, my))
+
+    rng = random.Random(11)
+    for _ in range(2500):
+        shade = rng.choice([QColor(40, 55, 25, 70), QColor(150, 150, 110, 60)])
+        _ellipse(painter, rng.uniform(0, width), rng.uniform(0, height), 1.6, 1.0, shade)
+
+    # The road edges pass through the vanishing point, so they are vertical on the map.
+    road_left, road_right = road_edges(proj.near_y, proj.near_y)
+    left, _ = proj.to_map(road_left, proj.near_y)
+    right, _ = proj.to_map(road_right, proj.near_y)
+    _poly(painter, _rect_pts(left, -2, right - left, height + 4), "#a8946a", "#8c7a55")
+    painter.setPen(QPen(QColor(110, 95, 65, 140), 2.0, Qt.DashLine))
+    painter.drawLine(QPointF((left + right) / 2, 0), QPointF((left + right) / 2, height))
+    for _ in range(300):
+        _ellipse(painter, rng.uniform(left, right), rng.uniform(0, height), 1.6, 0.9, QColor(90, 75, 50, 70))
+
+
+def draw_tree_top(painter: QPainter, x: float, y: float, r: float) -> None:
+    """Draw a tree canopy seen from above.
+
+    :param painter: Active painter.
+    :type painter: QPainter
+    :param x: Trunk x on the map.
+    :type x: float
+    :param y: Trunk y on the map.
+    :type y: float
+    :param r: Canopy radius in map pixels.
+    :type r: float
+    """
+    _shadow(painter, x + r * 0.5, y + r * 0.4, r * 1.05, r * 0.95)
+    painter.setPen(QPen(QColor("#1f3018"), 1.0))
+    painter.setBrush(QBrush(QColor("#2f4a24")))
+    painter.drawEllipse(QPointF(x, y), r, r)
+    _ellipse(painter, x - r * 0.25, y - r * 0.25, r * 0.55, r * 0.55, QColor("#3c5c2c"))
+    _ellipse(painter, x - r * 0.35, y - r * 0.35, r * 0.25, r * 0.25, QColor("#58783e"))
+
+
+def draw_building_top(painter: QPainter, x: float, y: float, w: float, d: float) -> None:
+    """Draw a flat roof seen from above; ``(x, y)`` is its near-left corner.
+
+    :param painter: Active painter.
+    :type painter: QPainter
+    :param x: Left edge on the map.
+    :type x: float
+    :param y: Near (bottom) edge on the map.
+    :type y: float
+    :param w: Width in map pixels.
+    :type w: float
+    :param d: Depth in map pixels.
+    :type d: float
+    """
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QBrush(QColor(0, 0, 0, 70)))
+    painter.drawRect(QRectF(x + 3, y - d + 3, w, d))
+    _poly(painter, _rect_pts(x, y - d, w, d), "#b8ab95", "#6e6556")
+    painter.setPen(QPen(QColor("#9c907b"), 1.0))
+    painter.drawLine(QPointF(x + 2, y - d / 2), QPointF(x + w - 2, y - d / 2))
+
+
+def draw_frustum(painter: QPainter, proj: GroundProjection) -> None:
+    """Shade ground outside the camera view and outline the view and the drone.
+
+    :param painter: Active painter.
+    :type painter: QPainter
+    :param proj: Camera-to-map projection.
+    :type proj: GroundProjection
+    """
+    width, height = proj.map_size
+    view = QPolygonF([QPointF(x, y) for x, y in proj.frustum()])
+    outside = QPainterPath()
+    outside.addRect(QRectF(0, 0, width, height))
+    inside = QPainterPath()
+    inside.addPolygon(view)
+    inside.closeSubpath()
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QBrush(QColor(15, 20, 25, 110)))
+    painter.drawPath(outside.subtracted(inside))
+
+    cam = QPointF(*proj.camera())
+    painter.setPen(QPen(QColor(79, 209, 255, 110), 1.0, Qt.DashLine))
+    near_left, far_left, far_right, near_right = proj.frustum()
+    painter.drawLine(cam, QPointF(*far_left))
+    painter.drawLine(cam, QPointF(*far_right))
+    painter.setPen(QPen(QColor(79, 209, 255, 200), 1.5))
+    painter.setBrush(Qt.NoBrush)
+    painter.drawPolygon(view)
+
+    painter.setPen(QPen(QColor("#0b1a22"), 1.0))
+    painter.setBrush(QBrush(QColor("#4fd1ff")))
+    cx, cy = cam.x(), cam.y() - 10
+    painter.drawPolygon(QPolygonF([QPointF(cx, cy - 9), QPointF(cx + 7, cy + 7), QPointF(cx, cy + 3), QPointF(cx - 7, cy + 7)]))
+
+
+def render_map(targets: Sequence[Target], proj: GroundProjection = DEFAULT_PROJECTION) -> QImage:
+    """Render the top-down map of the camera scene.
+
+    Trees, buildings and vehicles are placed by projecting their ground point
+    in the camera image with ``proj``; scenery beyond ``proj.far_y`` is left out.
+
+    :param targets: Targets whose ``label`` selects the vehicle drawer.
+    :type targets: Sequence[Target]
+    :param proj: Camera-to-map projection.
+    :type proj: GroundProjection
+    :returns: The rendered image, of size ``proj.map_size``.
+    :rtype: QImage
+    :raises KeyError: If a target label has no vehicle drawer.
+    """
+    width, height = proj.map_size
+    image = QImage(int(round(width)), int(round(height)), QImage.Format_ARGB32)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.Antialiasing)
+    draw_map_ground(painter, proj)
+
+    unit = proj.map_scale * 1.5  # scenery drawn a little larger than life for legibility
+    for kind, x, y in sorted(SCENERY, key=lambda item: item[2]):
+        if y < proj.far_y:
+            continue
+        mx, my = proj.to_map(x, y)
+        if kind == "tree":
+            draw_tree_top(painter, mx, my, 20 * unit)
+        else:
+            draw_building_top(painter, mx, my, 90 * unit, 36 * unit)
+    for t in targets:
+        TOP_VEHICLE_DRAWERS[t.label](painter, proj.target_footprint(t.rect))
+    draw_frustum(painter, proj)
+    painter.end()
+    return image
+
+
 def main() -> int:
-    """Render the demo scene to ``inputs/scenario.png``.
+    """Render the camera view to ``inputs/scenario.png`` and the map to ``inputs/map.png``.
 
     :returns: Process exit code.
     :rtype: int
@@ -482,11 +747,15 @@ def main() -> int:
 
     app = QGuiApplication.instance() or QGuiApplication(sys.argv)  # noqa: F841 (keeps Qt alive)
     SCENARIO_PATH.parent.mkdir(exist_ok=True)
-    image = render_scenario(DEMO_TARGETS, SCENE_SIZE)
-    if not image.save(str(SCENARIO_PATH)):
-        print(f"Failed to write {SCENARIO_PATH}", file=sys.stderr)
-        return 1
-    print(f"Wrote {SCENARIO_PATH.relative_to(HERE)}")
+    outputs = [
+        (SCENARIO_PATH, render_scenario(DEMO_TARGETS, SCENE_SIZE)),
+        (MAP_PATH, render_map(DEMO_TARGETS)),
+    ]
+    for path, image in outputs:
+        if not image.save(str(path)):
+            print(f"Failed to write {path}", file=sys.stderr)
+            return 1
+        print(f"Wrote {path.relative_to(HERE)}")
     return 0
 
 
