@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QInputDialog,
     QMenu,
     QMessageBox,
     QPlainTextEdit,
@@ -382,6 +383,27 @@ class RadialMenuView(QGraphicsView, MenuUI):
             action.setChecked(option == current)
         chosen = menu.exec(QCursor.pos())
         return chosen.text() if chosen is not None else None
+
+    def ask_number(
+        self, title: str, current: float, minimum: float, maximum: float
+    ) -> Optional[float]:
+        """Ask for a number in a dialog.
+
+        :param title: Prompt shown to the operator.
+        :type title: str
+        :param current: Pre-filled value.
+        :type current: float
+        :param minimum: Smallest accepted value.
+        :type minimum: float
+        :param maximum: Largest accepted value.
+        :type maximum: float
+        :returns: Entered value, or ``None`` if cancelled.
+        :rtype: float or None
+        """
+        value, ok = QInputDialog.getDouble(
+            self, "Strike timing", title, current, minimum, maximum, 1
+        )
+        return value if ok else None
 
     def show_message(self, text: str, modal: bool = False) -> None:
         """Show a status line, or a dialog if ``modal`` is set.

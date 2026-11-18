@@ -52,18 +52,29 @@ class Target:
         return x + w / 2.0, y + h / 2.0
 
 
+#: Default gap, in seconds, between one strike and the next in a sequence.
+DEFAULT_STRIKE_DELAY_S = 10.0
+#: Longest delay the operator may configure, in seconds.
+MAX_STRIKE_DELAY_S = 600.0
+
+
 @dataclass
 class DroneAssignment:
     """One strike-drone slot in a strike tasking.
 
+    Slots strike in list order: the first at T+0, each later one ``delay_s``
+    seconds after the slot before it.  ``delay_s`` of the first slot is unused.
+
     :param slot_id: Stable identifier of the slot within its mission.
     :param drone_id: Selected strike drone, or ``None`` if not chosen yet.
     :param vector: Strike vector (not implemented yet), or ``None``.
+    :param delay_s: Seconds after the previous slot's strike; ``0`` is simultaneous.
     """
 
     slot_id: int
     drone_id: Optional[str] = None
     vector: Optional[dict] = None
+    delay_s: float = DEFAULT_STRIKE_DELAY_S
 
 
 @dataclass
@@ -139,6 +150,30 @@ class MissionContext:
                 return assignment
         return None
 
+    def is_first_slot(self, slot_id: int) -> bool:
+        """Return whether a slot is the first strike in the sequence.
+
+        :param slot_id: Identifier of the slot.
+        :type slot_id: int
+        :returns: ``True`` if it is the first slot.
+        :rtype: bool
+        """
+        return bool(self.strike_assignments) and self.strike_assignments[0].slot_id == slot_id
+
+    def strike_offsets(self) -> Dict[int, float]:
+        """Compute each slot's strike time relative to the first strike.
+
+        :returns: Slot id mapped to seconds after the first strike (first is 0).
+        :rtype: dict[int, float]
+        """
+        offsets: Dict[int, float] = {}
+        t = 0.0
+        for i, a in enumerate(self.strike_assignments):
+            if i > 0:
+                t += a.delay_s
+            offsets[a.slot_id] = t
+        return offsets
+
     def free_drones(self, for_slot_id: Optional[int] = None) -> List[str]:
         """List drones that may be chosen for a slot.
 
@@ -165,6 +200,7 @@ class MissionContext:
         :rtype: dict
         """
         x, y, w, h = self.target.rect
+        offsets = self.strike_offsets()
         return {
             "target": {
                 "id": self.target.target_id,
@@ -180,7 +216,13 @@ class MissionContext:
             "strike": {
                 "is_strike_target": self.is_strike_target,
                 "drones": [
-                    {"slot": a.slot_id, "drone_id": a.drone_id, "vector": a.vector}
+                    {
+                        "slot": a.slot_id,
+                        "drone_id": a.drone_id,
+                        "vector": a.vector,
+                        "delay_after_previous_s": None if self.is_first_slot(a.slot_id) else a.delay_s,
+                        "strike_offset_s": offsets[a.slot_id],
+                    }
                     for a in self.strike_assignments
                 ],
             },
@@ -211,6 +253,25 @@ class MenuUI:
         :type current: str or None
         :returns: The chosen option, or ``None`` if cancelled.
         :rtype: str or None
+        :raises NotImplementedError: Always, in this base class.
+        """
+        raise NotImplementedError
+
+    def ask_number(
+        self, title: str, current: float, minimum: float, maximum: float
+    ) -> Optional[float]:
+        """Ask the operator for a number.
+
+        :param title: Prompt shown to the operator.
+        :type title: str
+        :param current: Value pre-filled in the input.
+        :type current: float
+        :param minimum: Smallest accepted value.
+        :type minimum: float
+        :param maximum: Largest accepted value.
+        :type maximum: float
+        :returns: The entered value, or ``None`` if cancelled.
+        :rtype: float or None
         :raises NotImplementedError: Always, in this base class.
         """
         raise NotImplementedError
@@ -694,6 +755,72 @@ class StrikeVectorNode(ActionNode):
         ui.show_message(f"Strike vector for {drone}: not implemented yet")
 
 
+def _fmt_seconds(seconds: float) -> str:
+    """Format a duration without a trailing ``.0``.
+
+    :param seconds: Duration in seconds.
+    :type seconds: float
+    :returns: e.g. ``"10 s"`` or ``"2.5 s"``.
+    :rtype: str
+    """
+    return f"{seconds:g} s"
+
+
+class StrikeTimingNode(ActionNode):
+    """Button that sets how long after the previous strike this slot strikes.
+
+    The first slot always strikes at T+0, so its button only explains that.
+
+    :param slot_id: Slot whose delay this button sets.
+    """
+
+    def __init__(self, slot_id: int) -> None:
+        """Initialise the button.
+
+        :param slot_id: Slot whose delay this button sets.
+        :type slot_id: int
+        """
+        super().__init__("Strike\ntiming", icon="⏱")
+        self.slot_id = slot_id
+
+    def display_label(self, ctx: MissionContext) -> str:
+        """Show the first strike as T+0 and later ones as their delay.
+
+        :param ctx: Current mission state.
+        :type ctx: MissionContext
+        :returns: Label text.
+        :rtype: str
+        """
+        slot = ctx.slot(self.slot_id)
+        if slot is None or ctx.is_first_slot(self.slot_id):
+            return "Strike at\nT+0 (first)"
+        return f"+{_fmt_seconds(slot.delay_s)}\nafter prev."
+
+    def run(self, ctx: MissionContext, ui: MenuUI) -> None:
+        """Ask for the delay and store it on the slot.
+
+        :param ctx: Current mission state.
+        :type ctx: MissionContext
+        :param ui: UI callbacks.
+        :type ui: MenuUI
+        """
+        slot = ctx.slot(self.slot_id)
+        if slot is None:
+            return
+        if ctx.is_first_slot(self.slot_id):
+            ui.show_message("First strike at T+0; set the delay on the later slots")
+            return
+        value = ui.ask_number(
+            "Seconds after the previous strike (0 = simultaneous)",
+            slot.delay_s,
+            0.0,
+            MAX_STRIKE_DELAY_S,
+        )
+        if value is not None:
+            slot.delay_s = value
+            ui.show_message(f"{slot.drone_id}: strikes {_fmt_seconds(value)} after the previous drone")
+
+
 class DroneSlotNode(SelectFromListNode):
     """A strike-drone slot; clicking opens a dropdown of free strike drones.
 
@@ -710,6 +837,7 @@ class DroneSlotNode(SelectFromListNode):
         """
         super().__init__(f"Slot {slot_id}", icon="✈")
         self.slot_id = slot_id
+        self._timing_node = StrikeTimingNode(slot_id)
         self._vector_node = StrikeVectorNode(slot_id)
 
     def options(self, ctx: MissionContext) -> List[str]:
@@ -749,14 +877,14 @@ class DroneSlotNode(SelectFromListNode):
             slot.drone_id = choice
 
     def children(self, ctx: MissionContext) -> List[MenuNode]:
-        """Show the strike-vector button once a drone is chosen.
+        """Show the timing and strike-vector buttons once a drone is chosen.
 
         :param ctx: Current mission state.
         :type ctx: MissionContext
-        :returns: ``[StrikeVectorNode]`` if a drone is assigned, else ``[]``.
+        :returns: ``[StrikeTimingNode, StrikeVectorNode]`` if a drone is assigned, else ``[]``.
         :rtype: list[MenuNode]
         """
-        return [self._vector_node] if self.current(ctx) else []
+        return [self._timing_node, self._vector_node] if self.current(ctx) else []
 
     def display_label(self, ctx: MissionContext) -> str:
         """Show the drone name, or a prompt if none is chosen.
